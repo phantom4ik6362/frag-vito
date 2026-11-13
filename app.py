@@ -174,9 +174,6 @@ def enqueue(conn, ident, chat, message, status, action=None, attachment='[Вло
             'INSERT INTO telegram_jobs (id,chat_id,text,status,due) VALUES (?,?,?,?,?)',
             (ident, chat, message or attachment, 'pending', now),
         )
-        if status in {'pending', 'media'}:
-            excerpt = (message or attachment)[:1000]
-            queue_notice(conn, 'received:' + ident, chat, f'Новое сообщение в Авито\nЧат: {chat}\n\n{excerpt}')
     return bool(inserted)
 
 

@@ -38,21 +38,20 @@ class ReleaseTests(unittest.IsolatedAsyncioTestCase):
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app.app), base_url='http://test') as client:
             self.assertEqual((await client.post('/webhook/' + 'x' * 32, json=event)).status_code, 200)
 
-    async def test_receipt_and_result_do_not_wait_for_other_messages(self):
+    async def test_one_report_per_batch_without_waiting_for_next_input(self):
         await self.post('buyer', 456)
         await self.post('buyer', 456)
-        item = telegram_notify.claim_report(app.db, time.time(), 90)
-        self.assertEqual(item[0], 'received:buyer')
-        with app.db() as conn:
-            conn.execute("UPDATE telegram_jobs SET status='sent' WHERE id='received:buyer'")
+        await self.post('second', 456)
+        self.assertIsNone(telegram_notify.claim_report(app.db, time.time(), 0))
         batch = app.claim_batch()
+        self.assertEqual(len(batch), 2)
         await self.post('newer', 456)
         app.record_batch(batch, 'skipped', 'model_error')
-        self.assertEqual(telegram_notify.claim_report(app.db, time.time(), 90)[0], 'received:newer')
-        item = telegram_notify.claim_report(app.db, time.time(), 90)
-        self.assertEqual(item[0], 'buyer')
-        self.assertIn('не смог обработать', item[1])
-        self.assertIsNone(telegram_notify.claim_report(app.db, time.time(), 90))
+        item = telegram_notify.claim_report(app.db, time.time(), 0)
+        self.assertEqual(item[0], 'second')
+        self.assertIn('Сообщения\nЗдравствуйте\nЗдравствуйте', item[1])
+        self.assertIn('Действие\nНе смог обработать', item[1])
+        self.assertIsNone(telegram_notify.claim_report(app.db, time.time(), 0))
 
     async def test_operator_during_classification(self):
         await self.post('buyer', 456)
@@ -105,11 +104,14 @@ class ReleaseTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(app.claim_batch(), [])
         report = telegram_notify.claim_report(app.db, time.time(), 90)
         self.assertEqual(report[0], 'missing')
-        self.assertIn('нашли входящее сообщение', report[1])
+        self.assertIn('Сообщение найдено при сверке', report[1])
 
     async def test_result_waits_for_receipt_retry_and_failed_health(self):
         await self.post('buyer', 456)
         app.record_batch(app.claim_batch(), 'skipped', 'model_error')
+        now = time.time()
+        with app.db() as conn:
+            app.queue_notice(conn, 'received:buyer', 'chat', 'Старое уведомление')
         now = time.time()
         self.assertEqual(telegram_notify.claim_report(app.db, now, 0)[0], 'received:buyer')
         with app.db() as conn:

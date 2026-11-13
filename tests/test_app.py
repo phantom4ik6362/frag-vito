@@ -113,7 +113,7 @@ class AppTests(unittest.TestCase):
                         self.assertEqual((await client.post(url, json=self.event)).status_code, 200)
             with app.db() as c:
                 rows = c.execute('SELECT id, text FROM telegram_jobs ORDER BY id').fetchall()
-            self.assertEqual([row['id'] for row in rows], ['image', 'm1', 'received:image', 'received:m1'])
+            self.assertEqual([row['id'] for row in rows], ['image', 'm1'])
             self.assertIn('Есть доставка?', rows[-1]['text'])
         asyncio.run(run())
 

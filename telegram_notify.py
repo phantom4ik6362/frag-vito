@@ -9,10 +9,6 @@ import httpx
 
 log = logging.getLogger('avito-bot.telegram')
 UNFINISHED = ('pending', 'processing', 'sending')
-GREETINGS = re.compile(
-    r'(?:(?:здравствуйте|здравствуй|привет|добрый день|добрый вечер|доброе утро|доброго времени суток)[ !.,?]*)+',
-    re.IGNORECASE,
-)
 SENT_ACTIONS = {
     'street_quote': 'Покупатель просит расчёт для уличного киоска. Нужно подготовить предложение.',
     'needs_human': 'Я подтвердил получение вопроса. Нужен ваш ответ в Авито.',
@@ -73,49 +69,29 @@ async def send_report(client, config, text):
     return ('unknown' if response.status_code >= 500 else 'failed'), 0
 
 
-def format_report(rows, continuation):
-    title = 'Покупатель снова написал в Авито.' if continuation else 'У вас новый диалог в Авито.'
-    messages = [row['text'].strip() for row in rows]
-    actions = {row['template_id'] for row in rows if row['reply_status'] == 'sent'}
-    if 'delivery_quote_requested' in actions:
-        actions.discard('clarify_delivery_city')
-    details = [line for action, line in SENT_ACTIONS.items() if action in actions]
-    if actions - SENT_ACTIONS.keys() - {'clarify_intent'}:
-        details.append('Отправил покупателю ответ по его вопросу.')
-    if 'clarify_intent' in actions:
-        if all(GREETINGS.fullmatch(message) for message in messages):
-            details.append('Покупатель поздоровался. Я спросил, чем помочь, и пока ответа нет.')
-        elif not details:
-            details.append('Я уточнил, что интересует покупателя. Посмотрите, пожалуйста, переписку.')
-    if any(row['reply_status'] in {'failed', 'unknown'} for row in rows):
-        details.append('Проверьте переписку: отправка автоответа не подтверждена.')
-    elif any(row['template_id'] == 'model_error' for row in rows):
-        details.append('Я не смог обработать сообщение. Посмотрите, пожалуйста, переписку.')
-    elif any(row['template_id'] == 'recovered_handoff' for row in rows):
-        details.append('При сверке с Авито нашли входящее сообщение. Проверьте, нужен ли ответ покупателю.')
-    elif any(row['template_id'] == 'operator' for row in rows):
-        details.append('Диалог ведёт продавец. Автоответ не отправлен.')
-    elif any(row['template_id'] in {'stop', 'handoff'} for row in rows):
-        details.append('Дальше нужен ваш ответ в Авито.')
-    elif not details:
-        if all(row['reply_status'] == 'media' for row in rows):
-            details.append('Покупатель прислал вложение. Откройте переписку, чтобы его посмотреть.')
-        elif all(GREETINGS.fullmatch(message) for message in messages):
-            details.append('Покупатель поздоровался. Вопроса пока нет.')
-        else:
-            details.append('Я оставил сообщение без автоответа. Посмотрите, пожалуйста, переписку.')
-    elif actions & {'street_overview', 'turnkey_overview', 'availability_yes'}:
-        details.append('Посмотрите переписку, чтобы продолжить общение.')
-
-    if not all(GREETINGS.fullmatch(message) for message in messages):
-        quotes = list(dict.fromkeys(message for message in messages if message and not GREETINGS.fullmatch(message)))
-        if quotes:
-            recent = quotes[-3:]
-            details.append('Последние сообщения покупателя:\n' + '\n'.join(
-                '«' + message[:320] + ('…' if len(message) > 320 else '') + '»'
-                for message in recent
-            ))
-    return title + '\n\n' + '\n\n'.join(details)
+def format_report(row):
+    status, action = row['reply_status'], row['template_id']
+    if status == 'failed':
+        outcome = 'Авито отклонило ответ. Нужен продавец.'
+    elif status == 'unknown':
+        outcome = 'Отправка ответа не подтверждена. Проверьте чат в Авито.'
+    elif status == 'media':
+        outcome = 'Вложение передано на просмотр продавцу.'
+    elif status == 'sent':
+        outcome = SENT_ACTIONS.get(action, 'Автоответ отправлен.')
+        if action == 'clarify_intent':
+            outcome = 'Уточнил, что интересует покупателя.'
+    else:
+        outcome = {
+            'model_error': 'Не смог обработать сообщение. Нужен продавец.',
+            'recovered_handoff': 'Сообщение найдено при сверке с Авито. Проверьте, нужен ли ответ.',
+            'operator': 'Чат ведёт продавец. Автоответ пропущен.',
+            'stop': 'Нужен ответ продавца.',
+            'handoff': 'Нужен ответ продавца.',
+        }.get(action, 'Без автоответа.')
+    message = row['text'].strip() or '[Нет текста]'
+    excerpt = message[:1200] + ('…' if len(message) > 1200 else '')
+    return f"Авито · {row['chat_id']}\n\nСообщения\n{excerpt}\n\nДействие\n{outcome}"
 
 
 def claim_report(db, now, idle):
@@ -141,7 +117,7 @@ def claim_report(db, now, idle):
             connection.execute("UPDATE telegram_jobs SET status='sending' WHERE id=?", (retry['id'],))
             return retry['id'], retry['text'], retry['attempts']
 
-        rows = connection.execute("""
+        row = connection.execute("""
             SELECT t.id, t.chat_id, CASE WHEN j.status='media' THEN t.text ELSE j.text END AS text, j.status AS reply_status, j.template_id
             FROM telegram_jobs AS t JOIN jobs AS j ON j.id=t.id
             WHERE t.status='pending' AND t.due<=?
@@ -152,28 +128,19 @@ def claim_report(db, now, idle):
             )
             AND j.status NOT IN (?, ?, ?, 'merged')
             ORDER BY j.created, j.rowid LIMIT 1
-        """, (now, *UNFINISHED)).fetchall()
-        if not rows:
+        """, (now, *UNFINISHED)).fetchone()
+        if row is None:
             return None
-        chat_id = rows[0]['chat_id']
-        # Earlier inputs in a processed batch already have individual receipt notices.
+        chat_id = row['chat_id']
+        # Earlier inputs are included in the final job text.
         connection.execute("""
             UPDATE telegram_jobs SET status='merged'
             WHERE chat_id=? AND status='pending' AND id IN (
                 SELECT id FROM jobs WHERE chat_id=? AND status='merged'
             )
         """, (chat_id, chat_id))
-        continuation = connection.execute("""
-            SELECT 1 FROM telegram_jobs
-            WHERE chat_id=? AND status IN ('sent', 'unknown')
-            AND id NOT LIKE 'received:%' AND id NOT LIKE 'operator:%' LIMIT 1
-        """, (chat_id,)).fetchone() is not None
-        report = format_report(rows, continuation) + '\n\nЧат: ' + chat_id
-        report_id = rows[-1]['id']
-        connection.executemany(
-            "UPDATE telegram_jobs SET status='merged' WHERE id=?",
-            [(row['id'],) for row in rows[:-1]],
-        )
+        report = format_report(row)
+        report_id = row['id']
         connection.execute(
             "UPDATE telegram_jobs SET status='sending', text=?, attempts=0 WHERE id=?",
             (report, report_id),
