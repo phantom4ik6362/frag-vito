@@ -22,6 +22,19 @@ CHANNEL_QUESTIONS = {
 }
 
 
+# Explicitly unresolved destinations override a model's city flag.
+UNRESOLVED_DESTINATION = re.compile(
+    r'\b(?:в (?:другой|другом|другую) (?:город\w*|насел[её]нн\w* пункт\w*)'
+    r'|(?:город|адрес|место) (?:пока )?(?:не знаю|не определ[её]н|уточняю)'
+    r'|пока уточняю)\b',
+    re.IGNORECASE,
+)
+EXPLICIT_DESTINATION = re.compile(
+    r'(?i:\b(?:везти|доставить|отправить)\s+(?:нужно\s+|надо\s+)?(?:в|во|до)\s+)'
+    r'(?!(?i:друг(?:ой|ом|ую))\b)[А-ЯЁ][а-яё]+'
+)
+
+
 @dataclass(frozen=True)
 class Reply:
     id: str
@@ -35,6 +48,11 @@ async def decide(client, messages, history, options, model=None):
 
     last = next((action for action in reversed(previous) if action not in {'ignore', 'model_error'}), None)
     waiting_city = last == 'clarify_delivery_city'
+    if waiting_city:
+        combined = '\n'.join(messages)
+        uncertainties = list(UNRESOLVED_DESTINATION.finditer(combined))
+        if uncertainties and not EXPLICIT_DESTINATION.search(combined, uncertainties[-1].end()):
+            return Reply('ignore')
     system = (BASE / 'prompt.txt').read_text(encoding='utf-8')
     payload = {
         'messages': messages,
