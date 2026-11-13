@@ -4,6 +4,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY app.py dialogue.py telegram_notify.py manage.py reconcile.py prompt.txt ./
 COPY messages ./messages
+RUN python -c "from app import templates; templates()"
 RUN mkdir /app/data && useradd -m appuser && chown -R appuser:appuser /app
 USER appuser
 ENV PORT=8000 PYTHONUNBUFFERED=1
