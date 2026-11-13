@@ -58,12 +58,25 @@ async def decide(client, messages, history, options, model=None):
         },
     )
     response.raise_for_status()
-    result = json.loads(response.json()['choices'][0]['message']['content'])
-    if not isinstance(result, dict) or not isinstance(result.get('id'), str):
-        raise ValueError('Invalid model decision')
-    selected = result['id']
-    if selected not in DECISIONS and selected not in options:
-        raise ValueError('Unknown model decision')
+    content = response.json()['choices'][0]['message']['content']
+    if not isinstance(content, str):
+        raise ValueError('decision_content_type')
+    content = content.strip()
+    fenced = re.fullmatch(r"```(?:json)?\s*(.*?)\s*```", content, re.I | re.S)
+    try:
+        result = json.loads(fenced.group(1) if fenced else content)
+    except json.JSONDecodeError:
+        raise ValueError('decision_json_invalid') from None
+    if not isinstance(result, dict):
+        raise ValueError('decision_not_object')
+    if waiting_city:
+        if type(result.get('city')) is not bool:
+            raise ValueError('decision_city_missing_or_invalid')
+        selected = 'delivery'
+    else:
+        selected = result.get('id')
+        if not isinstance(selected, str) or (selected not in DECISIONS and selected not in options):
+            raise ValueError('decision_unknown_action')
     city = result.get('city') is True
     location = result.get('location_status') is True
     messenger = result.get('messenger') is True
@@ -124,7 +137,15 @@ async def decide_safely(client, messages, history, options, log):
                 break
         except (httpx.TimeoutException, httpx.NetworkError) as exc:
             log.warning('Сбой соединения с моделью (%s)', type(exc).__name__)
-        except (httpx.HTTPError, KeyError, ValueError, TypeError, IndexError) as exc:
+        except ValueError as exc:
+            reason = str(exc)
+            if reason not in {
+                'decision_content_type', 'decision_json_invalid', 'decision_not_object',
+                'decision_city_missing_or_invalid', 'decision_unknown_action',
+            }:
+                reason = 'invalid_provider_response'
+            log.warning('Ошибка формата модели: %s (попытка %s)', reason, attempt + 1)
+        except (httpx.HTTPError, KeyError, TypeError, IndexError) as exc:
             log.warning('Ошибка классификации (%s)', type(exc).__name__)
             if not fallback:
                 break

@@ -53,7 +53,7 @@ class AppTests(unittest.TestCase):
                 ('clarify_intent', {}, [], 'clarify_intent'),
                 ('clarify_intent', {}, ['clarify_intent'], 'ignore'),
                 ('delivery', {}, ['clarify_intent', 'ignore'], 'clarify_delivery_city'),
-                ('turnkey_overview', {}, ['clarify_delivery_city'], 'ignore'),
+                ('turnkey_overview', {'city': False}, ['clarify_delivery_city'], 'ignore'),
                 ('delivery', {'city': True, 'messenger': True}, ['clarify_delivery_city', 'model_error'], 'delivery_quote_requested'),
                 ('street_overview', {'city': True}, [], 'street_overview'),
                 ('turnkey_overview', {'location_status': True, 'messenger': True}, [], 'turnkey_overview'),
