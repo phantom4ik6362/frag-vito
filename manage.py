@@ -16,7 +16,25 @@ async def main():
     sub.add_parser('jobs', help='Статусы последних 50 сообщений')
     sub.add_parser('telegram-jobs', help='Статусы последних 50 уведомлений')
     sub.add_parser('check', help='Проверить настройки и шаблоны')
+    for command in ('pause-chat', 'resume-chat', 'ack-telegram'):
+        sub.add_parser(command).add_argument('identifier')
     args = parser.parse_args()
+    if args.command in ('pause-chat', 'resume-chat', 'ack-telegram'):
+        init_db(recover=False)
+        with db() as c:
+            if args.command == 'pause-chat':
+                c.execute('INSERT OR IGNORE INTO manual_chats VALUES (?)', (args.identifier,))
+            elif args.command == 'resume-chat':
+                c.execute('DELETE FROM manual_chats WHERE chat_id=?', (args.identifier,))
+            else:
+                result = c.execute(
+                    "UPDATE telegram_jobs SET status='acknowledged' WHERE id=? AND status IN ('failed','unknown')",
+                    (args.identifier,),
+                )
+                if not result.rowcount:
+                    raise SystemExit('Нет сбоя Telegram с таким ID.')
+        print('Готово.')
+        return
     if args.command == 'telegram-jobs':
         init_db(recover=False)
         with db() as c:

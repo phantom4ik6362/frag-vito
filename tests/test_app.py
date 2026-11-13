@@ -113,7 +113,8 @@ class AppTests(unittest.TestCase):
                         self.assertEqual((await client.post(url, json=self.event)).status_code, 200)
             with app.db() as c:
                 rows = c.execute('SELECT id, text FROM telegram_jobs ORDER BY id').fetchall()
-            self.assertEqual([tuple(row) for row in rows], [('image', '[Вложение: image]'), ('m1', 'Есть доставка?')])
+            self.assertEqual([row['id'] for row in rows], ['image', 'm1', 'received:image', 'received:m1'])
+            self.assertIn('Есть доставка?', rows[-1]['text'])
         asyncio.run(run())
 
     def test_telegram_post_and_rate_limit(self):

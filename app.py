@@ -17,6 +17,7 @@ from fastapi import FastAPI, HTTPException, Request
 
 from dialogue import REQUIRED, decide_safely
 import telegram_notify
+import reconcile
 
 BASE = Path(__file__).resolve().parent
 load_dotenv(BASE / '.env')
@@ -56,6 +57,7 @@ def init_db(recover=True):
     DB.parent.mkdir(parents=True, exist_ok=True)
     with db() as c:
         c.execute('PRAGMA journal_mode=WAL')
+        c.execute("CREATE TABLE IF NOT EXISTS runtime_state (key TEXT PRIMARY KEY, value REAL)")
         c.execute('''CREATE TABLE IF NOT EXISTS jobs (
             id TEXT PRIMARY KEY, chat_id TEXT NOT NULL, text TEXT NOT NULL,
             status TEXT NOT NULL, created REAL NOT NULL, due REAL NOT NULL,
@@ -64,12 +66,21 @@ def init_db(recover=True):
         c.execute("""CREATE TABLE IF NOT EXISTS telegram_jobs (
             id TEXT PRIMARY KEY, chat_id TEXT NOT NULL, text TEXT NOT NULL,
             status TEXT NOT NULL, due REAL NOT NULL, attempts INTEGER NOT NULL DEFAULT 0)""")
+        c.execute("""CREATE TABLE IF NOT EXISTS seller_events (
+            id TEXT PRIMARY KEY, chat_id TEXT NOT NULL, handled INTEGER NOT NULL DEFAULT 0)""")
+        c.execute("""CREATE TABLE IF NOT EXISTS bot_messages (
+            id TEXT PRIMARY KEY, chat_id TEXT NOT NULL)""")
+        c.execute("""CREATE TABLE IF NOT EXISTS manual_chats (
+            chat_id TEXT PRIMARY KEY)""")
+        c.execute("CREATE INDEX IF NOT EXISTS seller_unhandled ON seller_events(handled, chat_id)")
+        c.execute("CREATE INDEX IF NOT EXISTS jobs_status_due ON jobs(status, due)")
         c.execute("CREATE INDEX IF NOT EXISTS telegram_ready ON telegram_jobs(status, due)")
         # A send may have succeeded before a restart: never resend automatically.
         if recover:
             c.execute("UPDATE jobs SET status='unknown', error='restart during send' WHERE status='sending'")
             c.execute("UPDATE jobs SET status='pending' WHERE status='processing'")
             c.execute("UPDATE telegram_jobs SET status='unknown' WHERE status='sending'")
+            resolve_seller_events(c)
 
 
 def templates():
@@ -87,31 +98,86 @@ def templates():
     return found
 
 
-def extract_event(data, own_id, include_media=False):
+def parse_event(data, own_id, include_media=False):
     if not isinstance(data, dict) or not isinstance(data.get('payload'), dict):
-        return None
+        return None, 'payload'
     p = data['payload']
     if p.get('type') != 'message' or not isinstance(p.get('value'), dict):
-        return None
+        return None, 'event_type'
     v = p['value']
     # Require all identifiers; never trust a user ID from an unexpected account.
     if any(v.get(k) is None or str(v.get(k)).strip() == '' for k in ('id', 'chat_id', 'user_id', 'author_id')):
-        return None
-    if str(v['user_id']) != own_id or str(v['author_id']) == own_id:
-        return None
+        return None, 'missing_id'
+    if str(v['user_id']) != own_id:
+        return None, 'wrong_account'
     kind = v.get('type')
     if len(str(v['id'])) > 200 or len(str(v['chat_id'])) > 200:
-        return None
+        return None, 'id_length'
+    if str(v['author_id']) == own_id:
+        if isinstance(kind, str) and kind != 'system':
+            return None, 'seller'
+        return None, 'message_type'
     if kind != 'text':
         if include_media and isinstance(kind, str) and kind != 'system':
-            return str(v['id']), str(v['chat_id']), None
-        return None
+            return (str(v['id']), str(v['chat_id']), None), None
+        return None, 'message_type'
     content = v.get('content')
     if not isinstance(content, dict) or not isinstance(content.get('text'), str) or not content['text'].strip():
-        return None
+        return None, 'empty_text'
     if len(content['text']) > 10000:
-        return None
-    return str(v['id']), str(v['chat_id']), content['text'].strip()
+        return None, 'text_length'
+    return (str(v['id']), str(v['chat_id']), content['text'].strip()), None
+
+
+def extract_event(data, own_id, include_media=False):
+    event, _ = parse_event(data, own_id, include_media)
+    return event
+
+
+def queue_notice(conn, ident, chat, text):
+    if telegram_notify.settings() and not dry_run():
+        conn.execute(
+            "INSERT OR IGNORE INTO telegram_jobs (id,chat_id,text,status,due) VALUES (?,?,?,'notice',?)",
+            (ident, chat, text, time.time()),
+        )
+
+
+def resolve_seller_events(conn):
+    events = conn.execute("""
+        SELECT e.* FROM seller_events AS e WHERE handled=0
+        AND NOT EXISTS (SELECT 1 FROM jobs WHERE chat_id=e.chat_id AND status='sending')
+    """).fetchall()
+    for event in events:
+        ident, chat = event['id'], event['chat_id']
+        known = conn.execute('SELECT 1 FROM bot_messages WHERE id=? AND chat_id=?', (ident, chat)).fetchone()
+        if not known:
+            changed = conn.execute('INSERT OR IGNORE INTO manual_chats VALUES (?)', (chat,)).rowcount
+            if changed:
+                queue_notice(conn, 'operator:' + ident, chat,
+                             f'В чате Авито появилось исходящее сообщение. Бот не смог подтвердить, что это его сообщение. Автоответы приостановлены. Проверьте переписку.\nЧат: {chat}')
+        conn.execute('UPDATE seller_events SET handled=1 WHERE id=?', (ident,))
+
+
+def is_manual(conn, chat):
+    return conn.execute('SELECT 1 FROM manual_chats WHERE chat_id=?', (chat,)).fetchone() is not None
+
+
+def enqueue(conn, ident, chat, message, status, action=None, attachment='[Вложение]'):
+    now = time.time()
+    delay = max(0, float(os.getenv('REPLY_DELAY_SECONDS', '5')))
+    inserted = conn.execute(
+        'INSERT OR IGNORE INTO jobs (id,chat_id,text,status,created,due,template_id) VALUES (?,?,?,?,?,?,?)',
+        (ident, chat, message or '', status, now, now + delay, action),
+    ).rowcount
+    if inserted and telegram_notify.settings() and not dry_run():
+        conn.execute(
+            'INSERT INTO telegram_jobs (id,chat_id,text,status,due) VALUES (?,?,?,?,?)',
+            (ident, chat, message or attachment, 'pending', now),
+        )
+        if status in {'pending', 'media'}:
+            excerpt = (message or attachment)[:1000]
+            queue_notice(conn, 'received:' + ident, chat, f'Новое сообщение в Авито\nЧат: {chat}\n\n{excerpt}')
+    return bool(inserted)
 
 
 class AvitoClient:
@@ -153,11 +219,11 @@ def claim_batch():
         c.execute('BEGIN IMMEDIATE')
         first = c.execute("""
             SELECT * FROM jobs AS j WHERE status='pending' AND due<=?
-            AND NOT EXISTS (
+            AND (j.created<=? OR NOT EXISTS (
                 SELECT 1 FROM jobs AS newer WHERE newer.chat_id=j.chat_id
                 AND newer.status='pending' AND newer.due>?
-            ) ORDER BY created, rowid LIMIT 1
-        """, (time.time(), time.time())).fetchone()
+            )) ORDER BY created, rowid LIMIT 1
+        """, (time.time(), time.time() - 60, time.time())).fetchone()
         if first is None:
             return []
         batch = c.execute("""
@@ -174,7 +240,7 @@ def history_for(chat, preview):
     with db() as c:
         rows = c.execute(f"""
             SELECT text, template_id FROM jobs WHERE chat_id=?
-            AND status IN ({placeholders}) AND template_id IS NOT NULL
+            AND status IN ({placeholders}) AND template_id IS NOT NULL AND template_id!='recovered_handoff'
             ORDER BY created DESC, rowid DESC LIMIT 16
         """, (chat, *statuses)).fetchall()
         sticky = c.execute(f"""
@@ -199,17 +265,27 @@ async def process_batch(client, api, batch):
     claimed_at = time.time()
     job = batch[-1]
     preview = dry_run()
+    with db() as c:
+        manual = is_manual(c, job['chat_id'])
     history = history_for(job['chat_id'], preview)
+    if manual:
+        record_batch(batch, 'dry_run' if preview else 'skipped', 'operator')
+        return
     reply = await decide_safely(client, [row['text'][:3000] for row in batch], history, templates(), log)
     # If a buyer wrote again while classification was running, reconsider the batch.
     with db() as c:
         c.execute('BEGIN IMMEDIATE')
-        if c.execute(
+        if claimed_at - batch[0]['created'] < 60 and c.execute(
             "SELECT 1 FROM jobs WHERE chat_id=? AND status='pending' AND created>? LIMIT 1",
             (job['chat_id'], claimed_at),
         ).fetchone():
             c.executemany("UPDATE jobs SET status='pending' WHERE id=?", [(row['id'],) for row in batch])
             return
+    with db() as c:
+        manual = is_manual(c, job['chat_id'])
+    if manual:
+        record_batch(batch, 'dry_run' if preview else 'skipped', 'operator')
+        return
     if preview or not reply.text:
         record_batch(batch, 'dry_run' if preview else 'skipped', reply.id)
         log.info('Диалог %s: %s%s', job['chat_id'], reply.id, ' (DRY_RUN)' if preview else '')
@@ -220,21 +296,40 @@ async def process_batch(client, api, batch):
         response = await api.send(job['chat_id'], reply.text)
     except Exception:
         update(job['id'], 'unknown', 'network error during send')
+        with db() as c:
+            resolve_seller_events(c)
         log.exception('Неясный результат отправки, нужна ручная проверка')
         return
     if response.is_success:
-        update(job['id'], 'sent')
-    elif response.status_code >= 500:
-        update(job['id'], 'unknown', f'Avito HTTP {response.status_code}')
+        try:
+            payload = response.json()
+            outgoing = payload.get('id') if isinstance(payload, dict) else None
+        except ValueError:
+            outgoing = None
+        with db() as c:
+            if isinstance(outgoing, (str, int)) and outgoing:
+                c.execute('INSERT OR IGNORE INTO bot_messages VALUES (?,?)', (str(outgoing), job['chat_id']))
+            else:
+                log.warning('Авито подтвердило ответ без ID; исходящее событие может включить ручной режим')
+            c.execute("UPDATE jobs SET status='sent' WHERE id=?", (job['id'],))
+            resolve_seller_events(c)
     else:
-        update(job['id'], 'failed', f'Avito HTTP {response.status_code}')
+        status = 'unknown' if response.status_code >= 500 else 'failed'
+        update(job['id'], status, f'Avito HTTP {response.status_code}')
+        with db() as c:
+            resolve_seller_events(c)
 
 
 async def worker(cfg):
     async with httpx.AsyncClient(timeout=20, follow_redirects=False) as client:
         api = AvitoClient(client, cfg)
         while True:
-            batch = claim_batch()
+            try:
+                batch = claim_batch()
+            except sqlite3.Error:
+                log.exception('Не удалось прочитать очередь Авито')
+                await asyncio.sleep(3)
+                continue
             if not batch:
                 await asyncio.sleep(0.5)
                 continue
@@ -246,15 +341,32 @@ async def worker(cfg):
                 log.exception('Не удалось обработать сообщения')
 
 
+async def reconcile_worker(cfg, interval):
+    async with httpx.AsyncClient(timeout=15) as client:
+        await reconcile.worker(AvitoClient(client, cfg), db, enqueue, cfg['AVITO_USER_ID'], interval, log)
+
+
+def watch(task):
+    if not task.cancelled():
+        error = task.exception()
+        log.error('Фоновая задача %s завершилась (%s)', task.get_name(), type(error).__name__)
+
+
 @asynccontextmanager
 async def lifespan(app):
     cfg = config()
     templates()
     telegram = telegram_notify.settings()
     init_db()
-    tasks = [asyncio.create_task(worker(cfg))]
+    interval = int(os.getenv('AVITO_RECONCILE_SECONDS', '0'))
+    tasks = [asyncio.create_task(worker(cfg), name='avito')]
     if telegram and not dry_run():
-        tasks.append(asyncio.create_task(telegram_notify.worker(db, telegram)))
+        tasks.append(asyncio.create_task(telegram_notify.worker(db, telegram), name='telegram'))
+    if interval > 0 and not dry_run():
+        tasks.append(asyncio.create_task(reconcile_worker(cfg, max(60, interval)), name='reconcile'))
+    app.state.workers = tasks
+    for task in tasks:
+        task.add_done_callback(watch)
     try:
         yield
     finally:
@@ -267,12 +379,29 @@ app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None
 
 @app.get('/health')
 async def health():
+    if any(task.done() for task in getattr(app.state, 'workers', ())):
+        raise HTTPException(status_code=503, detail='background worker stopped')
+    try:
+        with db() as conn:
+            if telegram_notify.settings() and not dry_run() and conn.execute(
+                "SELECT 1 FROM telegram_jobs WHERE status IN ('failed','unknown') LIMIT 1"
+            ).fetchone():
+                raise HTTPException(status_code=503, detail='Telegram delivery needs review')
+            if conn.execute("SELECT 1 FROM telegram_jobs WHERE status IN ('notice','report_retry') AND due<? LIMIT 1",
+                            (time.time() - 180,)).fetchone():
+                raise HTTPException(status_code=503, detail='Telegram queue overdue')
+            if conn.execute("SELECT 1 FROM jobs WHERE status IN ('pending','processing','sending') AND due<? LIMIT 1",
+                            (time.time() - 180,)).fetchone():
+                raise HTTPException(status_code=503, detail='Avito queue overdue')
+    except sqlite3.Error:
+        raise HTTPException(status_code=503, detail='database unavailable') from None
     return {'status': 'ok'}
 
 @app.post('/webhook/{secret}')
 async def webhook(secret: str, request: Request):
     cfg = config()
     if not hmac.compare_digest(secret, cfg['WEBHOOK_SECRET']):
+        log.warning('Вебхук Авито: неверный секрет')
         raise HTTPException(status_code=404)
     body = await request.body()
     if len(body) > 65536:
@@ -281,21 +410,24 @@ async def webhook(secret: str, request: Request):
         data = json.loads(body)
     except (ValueError, UnicodeDecodeError):
         raise HTTPException(status_code=400)
-    event = extract_event(data, cfg['AVITO_USER_ID'], include_media=True)
-    if event:
-        ident, chat, message = event
-        now = time.time()
-        telegram = telegram_notify.settings()
+    event, reason = parse_event(data, cfg['AVITO_USER_ID'], include_media=True)
+    if reason == 'seller':
+        value = data['payload']['value']
         with db() as c:
-            inserted = c.execute(
-                'INSERT OR IGNORE INTO jobs (id,chat_id,text,status,created,due) VALUES (?,?,?,?,?,?)',
-                (ident, chat, message or '', 'pending' if message else 'media',
-                 now, now + max(0, float(os.getenv('REPLY_DELAY_SECONDS', '5')))),
-            )
-            if inserted.rowcount and telegram and not dry_run():
-                media_type = str(data['payload']['value'].get('type', ''))[:80]
-                c.execute(
-                    'INSERT INTO telegram_jobs (id,chat_id,text,status,due) VALUES (?,?,?,?,?)',
-                    (ident, chat, message or f'[Вложение: {media_type}]', 'pending', now),
-                )
+            c.execute('INSERT OR IGNORE INTO seller_events (id,chat_id) VALUES (?,?)',
+                      (str(value['id']), str(value['chat_id'])))
+            resolve_seller_events(c)
+        log.info('Вебхук Авито: исходящее событие chat=%r', value['chat_id'])
+        return {'ok': True}
+    if event is None:
+        log.info('Вебхук Авито: filtered reason=%s', reason)
+        return {'ok': True}
+    ident, chat, message = event
+    media_type = str(data['payload']['value'].get('type', ''))[:80]
+    with db() as conn:
+        inserted = enqueue(
+            conn, ident, chat, message, 'pending' if message else 'media',
+            attachment=f'[Вложение: {media_type}]',
+        )
+    log.info('Вебхук Авито: %s chat=%r', 'queued' if inserted else 'duplicate', chat)
     return {'ok': True}

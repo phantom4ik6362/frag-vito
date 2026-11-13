@@ -1,8 +1,8 @@
-
 import asyncio
 import logging
 import os
 import re
+import sqlite3
 import time
 
 import httpx
@@ -14,6 +14,8 @@ GREETINGS = re.compile(
     re.IGNORECASE,
 )
 SENT_ACTIONS = {
+    'street_quote': 'Покупатель просит расчёт для уличного киоска. Нужно подготовить предложение.',
+    'needs_human': 'Я подтвердил получение вопроса. Нужен ваш ответ в Авито.',
     'turnkey_overview': 'Рассказал покупателю, как подготовим расчёт по кофейне.',
     'street_overview': 'Рассказал покупателю про уличный киоск и сообщил цену павильона.',
     'availability_yes': 'Подтвердил, что объявление актуально, и уточнил, какая комплектация интересует покупателя.',
@@ -89,7 +91,11 @@ def format_report(rows, continuation):
         details.append('Проверьте переписку: отправка автоответа не подтверждена.')
     elif any(row['template_id'] == 'model_error' for row in rows):
         details.append('Я не смог обработать сообщение. Посмотрите, пожалуйста, переписку.')
-    elif any(row['template_id'] == 'stop' for row in rows):
+    elif any(row['template_id'] == 'recovered_handoff' for row in rows):
+        details.append('При сверке с Авито нашли входящее сообщение. Проверьте, нужен ли ответ покупателю.')
+    elif any(row['template_id'] == 'operator' for row in rows):
+        details.append('Диалог ведёт продавец. Автоответ не отправлен.')
+    elif any(row['template_id'] in {'stop', 'handoff'} for row in rows):
         details.append('Дальше нужен ваш ответ в Авито.')
     elif not details:
         if all(row['reply_status'] == 'media' for row in rows):
@@ -115,6 +121,18 @@ def format_report(rows, continuation):
 def claim_report(db, now, idle):
     with db() as connection:
         connection.execute('BEGIN IMMEDIATE')
+        if connection.execute(
+            "SELECT 1 FROM runtime_state WHERE key='telegram_retry_after' AND value>?", (now,)
+        ).fetchone():
+            return None
+        notice = connection.execute("""
+            SELECT * FROM telegram_jobs WHERE status='notice' AND due<=?
+            ORDER BY due, rowid LIMIT 1
+        """, (now,)).fetchone()
+        if notice:
+            connection.execute("UPDATE telegram_jobs SET status='sending' WHERE id=?", (notice['id'],))
+            return notice['id'], notice['text'], notice['attempts']
+
         retry = connection.execute("""
             SELECT * FROM telegram_jobs WHERE status='report_retry' AND due<=?
             ORDER BY due LIMIT 1
@@ -123,29 +141,34 @@ def claim_report(db, now, idle):
             connection.execute("UPDATE telegram_jobs SET status='sending' WHERE id=?", (retry['id'],))
             return retry['id'], retry['text'], retry['attempts']
 
-        candidate = connection.execute("""
-            SELECT t.chat_id
-            FROM telegram_jobs AS t JOIN jobs AS j ON j.id=t.id
-            WHERE t.status='pending'
-            GROUP BY t.chat_id
-            HAVING MAX(j.created)<=? AND MAX(t.due)<=? AND SUM(j.status IN (?, ?, ?))=0
-            ORDER BY MAX(j.created) LIMIT 1
-        """, (now - idle, now, *UNFINISHED)).fetchone()
-        if not candidate:
-            return None
-
-        chat_id = candidate['chat_id']
         rows = connection.execute("""
-            SELECT t.id, t.text, j.status AS reply_status, j.template_id
+            SELECT t.id, t.chat_id, CASE WHEN j.status='media' THEN t.text ELSE j.text END AS text, j.status AS reply_status, j.template_id
             FROM telegram_jobs AS t JOIN jobs AS j ON j.id=t.id
-            WHERE t.chat_id=? AND t.status='pending'
-            ORDER BY j.created, j.rowid
-        """, (chat_id,)).fetchall()
+            WHERE t.status='pending' AND t.due<=?
+            AND NOT EXISTS (
+                SELECT 1 FROM telegram_jobs AS receipt
+                WHERE receipt.id='received:' || t.id
+                AND receipt.status IN ('notice','sending','report_retry')
+            )
+            AND j.status NOT IN (?, ?, ?, 'merged')
+            ORDER BY j.created, j.rowid LIMIT 1
+        """, (now, *UNFINISHED)).fetchall()
+        if not rows:
+            return None
+        chat_id = rows[0]['chat_id']
+        # Earlier inputs in a processed batch already have individual receipt notices.
+        connection.execute("""
+            UPDATE telegram_jobs SET status='merged'
+            WHERE chat_id=? AND status='pending' AND id IN (
+                SELECT id FROM jobs WHERE chat_id=? AND status='merged'
+            )
+        """, (chat_id, chat_id))
         continuation = connection.execute("""
             SELECT 1 FROM telegram_jobs
-            WHERE chat_id=? AND status IN ('sent', 'unknown') LIMIT 1
+            WHERE chat_id=? AND status IN ('sent', 'unknown')
+            AND id NOT LIKE 'received:%' AND id NOT LIKE 'operator:%' LIMIT 1
         """, (chat_id,)).fetchone() is not None
-        report = format_report(rows, continuation)
+        report = format_report(rows, continuation) + '\n\nЧат: ' + chat_id
         report_id = rows[-1]['id']
         connection.executemany(
             "UPDATE telegram_jobs SET status='merged' WHERE id=?",
@@ -166,25 +189,34 @@ def report_idle():
 
 
 async def worker(db, config):
-    idle = report_idle()
     async with httpx.AsyncClient(timeout=10) as client:
         while True:
-            item = claim_report(db, time.time(), idle)
+            try:
+                item = claim_report(db, time.time(), 0)
+            except sqlite3.Error:
+                log.exception('Не удалось прочитать очередь Telegram')
+                await asyncio.sleep(3)
+                continue
             if item is None:
                 await asyncio.sleep(0.5)
                 continue
             report_id, text, attempts = item
             status, delay = await send_report(client, config, text)
             attempts += 1
-            if status == 'pending':
+            retry_requested = status == 'pending'
+            if retry_requested:
                 status = 'failed' if attempts >= 5 else 'report_retry'
             with db() as connection:
+                if retry_requested:
+                    connection.execute(
+                        "INSERT OR REPLACE INTO runtime_state VALUES ('telegram_retry_after',?)",
+                        (time.time() + delay,),
+                    )
                 connection.execute(
                     'UPDATE telegram_jobs SET status=?, due=?, attempts=? WHERE id=?',
                     (status, time.time() + delay, attempts, report_id),
                 )
-            if status != 'sent':
+            if status == 'sent':
+                log.info('Уведомление Telegram отправлено: %r', report_id)
+            else:
                 log.warning('Отчёт %s: %s (попытка %s)', report_id, status, attempts)
-
-
-

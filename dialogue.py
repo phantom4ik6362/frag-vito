@@ -1,3 +1,5 @@
+import asyncio
+import re
 import json
 import os
 from dataclasses import dataclass
@@ -10,7 +12,7 @@ REQUIRED = {
     'turnkey_overview', 'street_overview', 'clarify_intent', 'availability_yes',
     'clarify_delivery_city', 'delivery_quote_requested',
 }
-DECISIONS = REQUIRED | {'delivery', 'ignore', 'stop'}
+DECISIONS = REQUIRED | {'delivery', 'ignore', 'stop', 'needs_human', 'street_quote'}
 CITY_QUESTION = 'Подскажите , в каком городе планируете установку ?'
 LOCATION_QUESTION = 'Чтобы посчитать максимально точно, подскажите , пожалуйста, локацию уже присмотрели или еще в поиске?'
 CHANNEL_QUESTIONS = {
@@ -26,7 +28,7 @@ class Reply:
     text: str = ''
 
 
-async def decide(client, messages, history, options):
+async def decide(client, messages, history, options, model=None):
     previous = [turn['action'] for turn in history]
     if 'stop' in previous:
         return Reply('stop')
@@ -47,7 +49,7 @@ async def decide(client, messages, history, options):
         os.getenv('LLM_BASE_URL', 'https://api.openai.com/v1').rstrip('/') + '/chat/completions',
         headers={'Authorization': 'Bearer ' + os.environ['LLM_API_KEY']},
         json={
-            'model': os.getenv('LLM_MODEL', 'gpt-4o-mini'),
+            'model': model or os.getenv('LLM_MODEL', 'gpt-4o-mini'),
             'temperature': 0,
             'messages': [
                 {'role': 'system', 'content': system},
@@ -66,6 +68,9 @@ async def decide(client, messages, history, options):
     location = result.get('location_status') is True
     messenger = result.get('messenger') is True
 
+    quote_request = any(re.fullmatch(r'расч[её]т[.!? ]*', msg.strip(), re.I) for msg in messages)
+    if not waiting_city and selected != 'stop' and quote_request and 'street_overview' in previous:
+        selected = 'street_quote'
     if waiting_city:
         selected = 'delivery_quote_requested' if city else 'ignore'
     elif selected in {'delivery', 'clarify_delivery_city', 'delivery_quote_requested'}:
@@ -73,9 +78,25 @@ async def decide(client, messages, history, options):
     if selected in {'stop', 'ignore'}:
         return Reply(selected)
     if selected in previous:
-        return Reply('ignore')
+        if selected == 'needs_human':
+            return Reply('handoff')
+        if selected in {'clarify_intent', 'clarify_delivery_city'}:
+            return Reply('ignore')
+        normalize = lambda text: ' '.join(re.findall(r'\w+', text.casefold().replace('ё', 'е')))
+        seen = {normalize(turn.get('text', '')) for turn in history if turn['action'] == selected}
+        if all(normalize(message) in seen for message in messages):
+            return Reply('ignore')
+        return Reply('handoff')
 
+    if selected == 'needs_human' and selected not in options:
+        return Reply('handoff')
     answer = options[selected]
+    if selected == 'street_quote':
+        if city:
+            answer = answer.replace('Подскажите, пожалуйста, в каком городе планируете установку?', '').strip()
+        if messenger:
+            answer = answer.replace('Куда удобнее отправить расчёт: WhatsApp, Telegram или Max?', '').strip()
+        answer = ' '.join(answer.split())
     if city and selected == 'street_overview':
         answer = answer.replace(CITY_QUESTION, '').rstrip()
     if location and selected == 'turnkey_overview':
@@ -86,17 +107,27 @@ async def decide(client, messages, history, options):
 
 
 async def decide_safely(client, messages, history, options, log):
-    try:
-        return await decide(client, messages, history, options)
-    except httpx.HTTPStatusError as exc:
-        log.warning(
-            'API модели вернул HTTP %s. Автоответ пропущен.',
-            exc.response.status_code,
-        )
-        return Reply('model_error')
-    except (httpx.HTTPError, KeyError, ValueError, TypeError, IndexError) as exc:
-        log.warning(
-            'Ошибка классификации (%s). Автоответ пропущен.',
-            type(exc).__name__,
-        )
-        return Reply('model_error')
+    fallback = os.getenv('LLM_FALLBACK_MODEL', '').strip()
+    for attempt in range(2):
+        retry_after = ''
+        try:
+            if attempt and fallback:
+                return await decide(client, messages, history, options, fallback)
+            return await decide(client, messages, history, options)
+        except httpx.HTTPStatusError as exc:
+            status = exc.response.status_code
+            log.warning('API модели вернул HTTP %s (попытка %s)', status, attempt + 1)
+            if status != 429 and status < 500:
+                break
+            retry_after = exc.response.headers.get('Retry-After', '')
+            if not fallback and retry_after.isdigit() and int(retry_after) > 3:
+                break
+        except (httpx.TimeoutException, httpx.NetworkError) as exc:
+            log.warning('Сбой соединения с моделью (%s)', type(exc).__name__)
+        except (httpx.HTTPError, KeyError, ValueError, TypeError, IndexError) as exc:
+            log.warning('Ошибка классификации (%s)', type(exc).__name__)
+            if not fallback:
+                break
+        if not attempt:
+            await asyncio.sleep(1 if fallback else max(1, int(retry_after) if retry_after.isdigit() else 1))
+    return Reply('model_error')
