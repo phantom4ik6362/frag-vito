@@ -91,6 +91,7 @@ def format_report(row):
             'closed': 'Бот завершил свою часть диалога. Новое сообщение для продавца.',
             'stop': 'Нужен ответ продавца.',
             'handoff': 'Нужен ответ продавца.',
+            'waiting_contact': 'Ожидаю номер телефона или никнейм покупателя.',
         }.get(action, 'Без автоответа.')
     message = row['text'].strip() or '[Нет текста]'
     excerpt = message[:1200] + ('…' if len(message) > 1200 else '')
