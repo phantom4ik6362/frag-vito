@@ -15,7 +15,7 @@ import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
 
-from dialogue import REQUIRED, decide_safely
+from dialogue import CLOSED, INTRO_QUESTIONS, REQUIRED, decide_safely, first_greeting
 import telegram_notify
 import reconcile
 
@@ -75,8 +75,25 @@ def init_db(recover=True):
         c.execute("CREATE INDEX IF NOT EXISTS seller_unhandled ON seller_events(handled, chat_id)")
         c.execute("CREATE INDEX IF NOT EXISTS jobs_status_due ON jobs(status, due)")
         c.execute("CREATE INDEX IF NOT EXISTS telegram_ready ON telegram_jobs(status, due)")
-        # A send may have succeeded before a restart: never resend automatically.
+        c.execute("""CREATE TABLE IF NOT EXISTS chat_dialogue (
+            chat_id TEXT NOT NULL, preview INTEGER NOT NULL, state TEXT NOT NULL,
+            PRIMARY KEY (chat_id, preview))""")
         if recover:
+            # Old jobs do not reliably identify which question was last sent.
+            migrated = c.execute(
+                "INSERT OR IGNORE INTO runtime_state VALUES ('reply_logic_v2', 1)"
+            ).rowcount
+            if migrated:
+                c.execute("""
+                    INSERT OR IGNORE INTO chat_dialogue
+                    SELECT DISTINCT chat_id, status='dry_run', ? FROM jobs
+                """, (CLOSED,))
+            c.execute("""
+                INSERT INTO chat_dialogue (chat_id,preview,state)
+                SELECT DISTINCT chat_id,0,? FROM jobs WHERE status='sending'
+                ON CONFLICT(chat_id,preview) DO UPDATE SET state=excluded.state
+            """, (CLOSED,))
+            # A send may have succeeded before a restart: never resend automatically.
             c.execute("UPDATE jobs SET status='unknown', error='restart during send' WHERE status='sending'")
             c.execute("UPDATE jobs SET status='pending' WHERE status='processing'")
             c.execute("UPDATE telegram_jobs SET status='unknown' WHERE status='sending'")
@@ -89,8 +106,11 @@ def templates():
         if not re.fullmatch(r'[A-Za-z0-9_-]{1,64}', path.stem):
             raise ValueError(f'Недопустимый ID файла: {path.name}')
         text = path.read_text(encoding='utf-8').strip()
-        if not text or len(text) > 1000:
+        if path.stem in REQUIRED and (not text or len(text) > 1000):
             raise ValueError(f'{path.name}: текст должен содержать от 1 до 1000 символов')
+        suffix = INTRO_QUESTIONS.get(path.stem, ('', ''))[1]
+        if path.stem in REQUIRED and len('Здравствуйте!\n\n' + text + '\n\n' + suffix) > 1000:
+            raise ValueError(f'{path.name}: автоответ превышает 1000 символов с учётом приветствия и вопроса')
         found[path.stem] = text
     missing = REQUIRED - found.keys()
     if missing:
@@ -169,6 +189,8 @@ def enqueue(conn, ident, chat, message, status, action=None, attachment='[Вло
         'INSERT OR IGNORE INTO jobs (id,chat_id,text,status,created,due,template_id) VALUES (?,?,?,?,?,?,?)',
         (ident, chat, message or '', status, now, now + delay, action),
     ).rowcount
+    if inserted and (status == 'media' or action == 'recovered_handoff'):
+        save_chat_state(conn, chat, dry_run(), CLOSED)
     if inserted and telegram_notify.settings() and not dry_run():
         conn.execute(
             'INSERT INTO telegram_jobs (id,chat_id,text,status,due) VALUES (?,?,?,?,?)',
@@ -201,14 +223,23 @@ class AvitoClient:
             r = await self.client.request(method, AVITO + path, headers={'Authorization': 'Bearer ' + token}, **kwargs)
         return r
 
+    async def listing_title(self, chat):
+        path = f"/messenger/v2/accounts/{self.cfg['AVITO_USER_ID']}/chats/{quote(chat, safe='')}"
+        try:
+            response = await self.request('GET', path, timeout=5)
+            response.raise_for_status()
+            details = response.json()
+        except (httpx.HTTPError, ValueError, KeyError, TypeError) as exc:
+            log.warning('Не удалось получить объявление для чата %r (%s)', chat, type(exc).__name__)
+            return ''
+        context = details.get('context') if isinstance(details, dict) else None
+        value = context.get('value') if isinstance(context, dict) else None
+        title = value.get('title') if isinstance(value, dict) else None
+        return title[:500] if isinstance(title, str) else ''
+
     async def send(self, chat, text):
         path = f"/messenger/v1/accounts/{self.cfg['AVITO_USER_ID']}/chats/{quote(chat, safe='')}/messages"
         return await self.request('POST', path, json={'type': 'text', 'message': {'text': text}})
-
-
-def update(job, status, error=None, template_id=None):
-    with db() as c:
-        c.execute('UPDATE jobs SET status=?, error=?, template_id=COALESCE(?,template_id) WHERE id=?', (status, error, template_id, job))
 
 
 def claim_batch():
@@ -231,91 +262,106 @@ def claim_batch():
         return batch
 
 
-def history_for(chat, preview):
-    statuses = ('dry_run',) if preview else ('sent', 'skipped', 'unknown')
-    placeholders = ','.join('?' for _ in statuses)
-    with db() as c:
-        rows = c.execute(f"""
-            SELECT text, template_id FROM jobs WHERE chat_id=?
-            AND status IN ({placeholders}) AND template_id IS NOT NULL AND template_id!='recovered_handoff'
-            ORDER BY created DESC, rowid DESC LIMIT 16
-        """, (chat, *statuses)).fetchall()
-        sticky = c.execute(f"""
-            SELECT 1 FROM jobs WHERE chat_id=?
-            AND status IN ({placeholders}) AND template_id='stop' LIMIT 1
-        """, (chat, *statuses)).fetchone()
-    result = [{'text': row['text'][-2000:], 'action': row['template_id']} for row in reversed(rows)]
-    if sticky:
-        result.append({'text': '', 'action': 'stop'})
-    return result
+def chat_state(conn, chat, preview):
+    row = conn.execute(
+        'SELECT state FROM chat_dialogue WHERE chat_id=? AND preview=?', (chat, preview),
+    ).fetchone()
+    return row['state'] if row is not None else None
 
 
-def record_batch(batch, status, action):
-    with db() as c:
-        c.execute('UPDATE jobs SET status=?, template_id=?, text=? WHERE id=?', (
-            status, action, '\n'.join(row['text'] for row in batch)[-10000:], batch[-1]['id'],
-        ))
-        c.executemany("UPDATE jobs SET status='merged' WHERE id=?", [(row['id'],) for row in batch[:-1]])
+def save_chat_state(conn, chat, preview, state):
+    conn.execute("""
+        INSERT INTO chat_dialogue (chat_id,preview,state) VALUES (?,?,?)
+        ON CONFLICT(chat_id,preview) DO UPDATE SET state=excluded.state
+        WHERE chat_dialogue.state!=?
+    """, (chat, preview, state, CLOSED))
+
+
+def record_batch(conn, batch, status, action):
+    conn.execute('UPDATE jobs SET status=?, template_id=?, text=? WHERE id=?', (
+        status, action, '\n'.join(row['text'] for row in batch)[-10000:], batch[-1]['id'],
+    ))
+    conn.executemany("UPDATE jobs SET status='merged' WHERE id=?", [(row['id'],) for row in batch[:-1]])
 
 
 async def process_batch(client, api, batch):
     claimed_at = time.time()
     job = batch[-1]
+    chat = job['chat_id']
     preview = dry_run()
+    skipped = 'dry_run' if preview else 'skipped'
     with db() as c:
-        manual = is_manual(c, job['chat_id'])
-    history = history_for(job['chat_id'], preview)
-    if manual:
-        record_batch(batch, 'dry_run' if preview else 'skipped', 'operator')
-        return
-    reply = await decide_safely(client, [row['text'][:3000] for row in batch], history, templates(), log)
-    # If a buyer wrote again while classification was running, reconsider the batch.
+        state = chat_state(c, chat, preview)
+        if is_manual(c, chat):
+            record_batch(c, batch, skipped, 'operator')
+            return
+        if state == CLOSED:
+            record_batch(c, batch, skipped, 'closed')
+            return
+
+    messages = [row['text'][:3000] for row in batch]
+    # Preview never calls Avito for listing metadata.
+    listing_title = ''
+    if state is None and not preview and chat.startswith('u2i-') and first_greeting(messages):
+        listing_title = await api.listing_title(chat)
+    reply = await decide_safely(client, messages, state, templates(), log, listing_title=listing_title)
     with db() as c:
         c.execute('BEGIN IMMEDIATE')
-        if claimed_at - batch[0]['created'] < 60 and c.execute(
-            "SELECT 1 FROM jobs WHERE chat_id=? AND status='pending' AND created>? LIMIT 1",
-            (job['chat_id'], claimed_at),
+        if is_manual(c, chat):
+            record_batch(c, batch, skipped, 'operator')
+            return
+        if chat_state(c, chat, preview) == CLOSED:
+            record_batch(c, batch, skipped, 'closed')
+            return
+        # Reconsider with recent follow-ups that arrived while classifying.
+        if len(batch) < 20 and claimed_at - batch[0]['created'] < 60 and c.execute(
+            "SELECT 1 FROM jobs WHERE chat_id=? AND status='pending' AND created>=? LIMIT 1",
+            (chat, claimed_at),
         ).fetchone():
             c.executemany("UPDATE jobs SET status='pending' WHERE id=?", [(row['id'],) for row in batch])
             return
-    with db() as c:
-        manual = is_manual(c, job['chat_id'])
-    if manual:
-        record_batch(batch, 'dry_run' if preview else 'skipped', 'operator')
-        return
-    if preview or not reply.text:
-        record_batch(batch, 'dry_run' if preview else 'skipped', reply.id)
-        log.info('Диалог %s: %s%s', job['chat_id'], reply.id, ' (DRY_RUN)' if preview else '')
-        return
+        if preview or not reply.text:
+            save_chat_state(c, chat, preview, reply.next_state)
+            record_batch(c, batch, skipped, reply.id)
+            log.info('Диалог %s: %s%s', chat, reply.id, ' (DRY_RUN)' if preview else '')
+            return
+        record_batch(c, batch, 'sending', reply.id)
 
-    record_batch(batch, 'sending', reply.id)
+    response = None
     try:
-        response = await api.send(job['chat_id'], reply.text)
-    except Exception:
-        update(job['id'], 'unknown', 'network error during send')
-        with db() as c:
-            resolve_seller_events(c)
-        log.exception('Неясный результат отправки, нужна ручная проверка')
-        return
-    if response.is_success:
+        response = await api.send(chat, reply.text)
+    except Exception as exc:
+        log.warning('Неясный результат отправки в Авито (%s)', type(exc).__name__)
+    if response is None:
+        status, error = 'unknown', 'network error during send'
+    elif response.is_success:
+        status, error = 'sent', None
+    else:
+        status = 'unknown' if response.status_code >= 500 else 'failed'
+        error = f'Avito HTTP {response.status_code}'
+    outgoing = None
+    if status == 'sent':
         try:
             payload = response.json()
             outgoing = payload.get('id') if isinstance(payload, dict) else None
         except ValueError:
-            outgoing = None
-        with db() as c:
-            if isinstance(outgoing, (str, int)) and outgoing:
-                c.execute('INSERT OR IGNORE INTO bot_messages VALUES (?,?)', (str(outgoing), job['chat_id']))
-            else:
-                log.warning('Авито подтвердило ответ без ID; исходящее событие может включить ручной режим')
-            c.execute("UPDATE jobs SET status='sent' WHERE id=?", (job['id'],))
-            resolve_seller_events(c)
-    else:
-        status = 'unknown' if response.status_code >= 500 else 'failed'
-        update(job['id'], status, f'Avito HTTP {response.status_code}')
-        with db() as c:
-            resolve_seller_events(c)
-
+            pass
+    with db() as c:
+        c.execute('BEGIN IMMEDIATE')
+        if type(outgoing) in (str, int) and outgoing:
+            c.execute('INSERT OR IGNORE INTO bot_messages VALUES (?,?)', (str(outgoing), chat))
+            next_state = reply.next_state
+        else:
+            next_state = CLOSED
+            if status == 'sent':
+                log.warning('Авито подтвердило ответ без ID; автоответы прекращены в чате %r', chat)
+        save_chat_state(c, chat, False, next_state)
+        c.execute('UPDATE jobs SET status=?, error=? WHERE id=?', (status, error, job['id']))
+        if status == 'sent' and next_state == CLOSED and reply.next_state != CLOSED:
+            queue_notice(c, 'unconfirmed:' + job['id'], chat,
+                         f'Авито приняло автоответ без ID сообщения. Автоответы остановлены. Проверьте чат: {chat}')
+        # Save our own message ID before deciding whether a racing outgoing event was manual.
+        resolve_seller_events(c)
 
 async def worker(cfg):
     async with httpx.AsyncClient(timeout=20, follow_redirects=False) as client:
@@ -333,8 +379,16 @@ async def worker(cfg):
             try:
                 await process_batch(client, api, batch)
             except Exception:
-                for job in batch:
-                    update(job['id'], 'failed', 'processing error; see logs')
+                with db() as c:
+                    c.execute('BEGIN IMMEDIATE')
+                    for job in batch:
+                        c.execute("""
+                            UPDATE jobs SET status=CASE WHEN status='sending' THEN 'unknown' ELSE 'failed' END,
+                            error='processing error; see logs'
+                            WHERE id=? AND status IN ('pending','processing','sending')
+                        """, (job['id'],))
+                    save_chat_state(c, batch[-1]['chat_id'], dry_run(), CLOSED)
+                    resolve_seller_events(c)
                 log.exception('Не удалось обработать сообщения')
 
 
@@ -354,6 +408,8 @@ async def lifespan(app):
     cfg = config()
     templates()
     telegram = telegram_notify.settings()
+    if not dry_run() and not telegram:
+        raise RuntimeError('Для боевого режима нужны TELEGRAM_BOT_TOKEN и TELEGRAM_CHAT_ID')
     init_db()
     interval = int(os.getenv('AVITO_RECONCILE_SECONDS', '0'))
     tasks = [asyncio.create_task(worker(cfg), name='avito')]

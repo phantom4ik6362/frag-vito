@@ -46,6 +46,10 @@ curl -fsS --retry 5 --retry-all-errors --retry-delay 1 \
 docker exec fragvito python manage.py subscribe https://bot.interviewintel.space
 ```
 
+## Обновить код после слияния в main
+
+Порядок сборки, замены контейнера и первой проверки описан в [UPDATE_REPLY_LOGIC.md](UPDATE_REPLY_LOGIC.md).
+
 ## Выключить или перезапустить контейнер
 
 | Действие | Команда |
@@ -153,6 +157,14 @@ docker exec fragvito python manage.py telegram-jobs
 
 После запуска бот может продолжить обработку незавершённых заданий из копии. Держите только один боевой экземпляр бота.
 
+## Возобновить автоответы в одном чате
+
+```bash
+docker exec fragvito python manage.py resume-chat 'CHAT_ID'
+```
+
+Команда снимает ручной режим и сбрасывает состояние диалога. История, очередь Telegram и защита от повторной доставки сохраняются. Если в чате есть задачи в работе, команда откажется его возобновлять.
+
 ## Сбросить данные одного диалога
 
 Возьмите `chat_id` из уведомления Telegram или вывода `docker exec fragvito python manage.py jobs`. Дождитесь окончания обработки сообщений в этом чате и подставьте его ID:
@@ -166,7 +178,7 @@ from app import db
 chat_id = sys.argv[1]
 with closing(db()) as conn, conn:
     conn.execute("BEGIN IMMEDIATE")
-    for table in ("jobs", "telegram_jobs", "seller_events", "bot_messages", "manual_chats"):
+    for table in ("jobs", "telegram_jobs", "seller_events", "bot_messages", "manual_chats", "chat_dialogue"):
         conn.execute(f"DELETE FROM {table} WHERE chat_id = ?", (chat_id,))
 print(f"Локальное состояние диалога удалено: {chat_id}")
 PY
