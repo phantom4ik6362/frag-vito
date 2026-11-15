@@ -88,20 +88,21 @@ class ReplyLogicTests(unittest.IsolatedAsyncioTestCase):
             'Здравствуйте, а какая цена под ключ как на фото?',
             model_result={'id': 'turnkey_overview', 'already_answered': False},
         )
-        self.assertEqual(state, 'location_status')
+        self.assertEqual(state, 'turnkey_details')
         self.assertFalse(manual, 'Own outgoing webhook must not close the chat')
-        self.assertEqual(self.sent[-1].count('?'), 1)
+        self.assertEqual(self.sent[-1].count('?'), 2)
         self.assertIn('локацию', self.sent[-1])
         row, state, _ = await self.turn('Да место уже готово')
-        self.assertEqual((row['template_id'], state), ('info_received', CLOSED))
+        self.assertEqual((row['template_id'], state), ('info_received', 'contact_channel'))
         self.assertEqual(self.sent[-1], 'Спасибо за информацию!')
         app.init_db()  # Restart before the buyer sends the phone.
         row, state, _ = await self.turn(f'{PHONE} Макс')
-        self.assertEqual((row['template_id'], state), ('closed', CLOSED))
-        self.assertEqual(len(self.sent), 2)
+        self.assertEqual((row['template_id'], state), ('contact_received', CLOSED))
+        self.assertEqual(len(self.sent), 3)
+        self.assertEqual(self.sent[-1], 'Спасибо за контакт! Свяжемся с вами.')
         reports = [telegram_notify.claim_report(app.db, float('inf'), 0) for _ in range(3)]
         self.assertIn(PHONE, reports[-1][1])
-        self.assertIn('для продавца', reports[-1][1])
+        self.assertIn('Поблагодарил за контакт', reports[-1][1])
 
     async def test_placement_question_does_not_start_delivery(self):
         await self.turn('Расчёт')
@@ -118,6 +119,18 @@ class ReplyLogicTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.sent[-1], 'Спасибо за контакт! Свяжемся с вами.')
         self.assertEqual(self.model_calls, 0)
 
+    async def test_messenger_then_nickname_is_acknowledged(self):
+        for index, nickname in enumerate(('Добрый день! @coffee_owner', 'никнейм: CoffeeOwner', 'В Telegram CoffeeOwner')):
+            with self.subTest(nickname=nickname):
+                chat = f'u2i-nickname-{index}'
+                await self.turn('Улица', chat=chat)
+                row, state, _ = await self.turn('Лучше в телеграм', chat=chat)
+                self.assertEqual((row['template_id'], state), ('waiting_contact', 'contact_channel'))
+                row, state, _ = await self.turn(nickname, chat=chat)
+                self.assertEqual((row['template_id'], state), ('contact_received', CLOSED))
+                self.assertEqual(self.sent[-1], 'Спасибо за контакт! Свяжемся с вами.')
+        self.assertEqual(self.model_calls, 0)
+
     async def test_callback_with_contact_and_mixed_delivery(self):
         row, state, _ = await self.turn(f'Интересна франшиза. Перезвоните, пожалуйста: {PHONE}')
         self.assertEqual((row['template_id'], state), ('contact_received', CLOSED))
@@ -130,11 +143,11 @@ class ReplyLogicTests(unittest.IsolatedAsyncioTestCase):
         await self.turn('Алтайский край, Павловский район, с. Павловск', chat='mixed')
         self.assertEqual(len(self.sent), 1)
 
-    async def test_greeting_uses_listing_and_cannot_quote_unverified_price(self):
+    async def test_greeting_uses_the_full_listing_template(self):
         row, state, _ = await self.turn('Здравствуйте!', title='Уличная кофейня самообслуживания')
-        self.assertEqual((row['template_id'], state), ('street_overview', 'installation_city'))
-        self.assertEqual(self.sent[-1].count('?'), 1)
-        self.assertNotIn('230 000', self.sent[-1])
+        self.assertEqual((row['template_id'], state), ('street_overview', 'street_details'))
+        self.assertEqual(self.sent[-1].count('?'), 2)
+        self.assertIn('230 000 ₽', self.sent[-1])
         row, state, _ = await self.turn('Здравствуйте!', title='Оборудование', chat='other')
         self.assertEqual((row['template_id'], state), ('handoff', CLOSED))
         self.assertEqual(self.model_calls, 0)
@@ -145,7 +158,7 @@ class ReplyLogicTests(unittest.IsolatedAsyncioTestCase):
                 row, state, _ = await self.turn(
                     message, title='Уличная кофейня самообслуживания', chat=f'u2i-hello-{index}',
                 )
-                self.assertEqual((row['template_id'], state), ('street_overview', 'installation_city'))
+                self.assertEqual((row['template_id'], state), ('street_overview', 'street_details'))
         self.assertEqual(self.model_calls, 0)
         self.assertEqual(self.listing_calls, 3)
 
@@ -154,7 +167,7 @@ class ReplyLogicTests(unittest.IsolatedAsyncioTestCase):
             'Моё почтение!', model_result={'id': 'greeting', 'already_answered': False},
             title='Уличная кофейня самообслуживания',
         )
-        self.assertEqual((row['template_id'], state), ('street_overview', 'installation_city'))
+        self.assertEqual((row['template_id'], state), ('street_overview', 'street_details'))
         self.assertEqual(self.model_calls, 1)
         self.assertEqual(self.listing_calls, 1)
 
@@ -182,16 +195,20 @@ class ReplyLogicTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(messages=messages):
                 row, _, _ = await self.turn(*messages, chat=f'u2i-command-{index}')
                 self.assertEqual((row['template_id'], row['status']), (expected, 'sent'))
+                if expected in {'street_overview', 'turnkey_overview'}:
+                    self.assertEqual(self.sent[-1], app.templates()[expected])
+                    self.assertEqual(self.sent[-1].count('Добрый день!)'), 1)
+                    self.assertTrue(self.sent[-1].endswith('Отправьте, пожалуйста, ваш номер телефона или никнейм.'))
         self.assertEqual(self.model_calls, 0)
         self.assertEqual(self.listing_calls, 0)
 
     async def test_keyword_works_after_bot_has_answered_greeting(self):
         await self.turn('Добрый день!', title='Кофейня под ключ')
         row, state, _ = await self.turn('улица')
-        self.assertEqual((row['template_id'], state), ('street_overview', 'installation_city'))
-        self.assertNotIn('Здравствуйте', self.sent[-1])
+        self.assertEqual((row['template_id'], state), ('street_overview', 'street_details'))
+        self.assertFalse(self.sent[-1].startswith(('Здравствуйте', 'Добрый день')))
         row, state, _ = await self.turn('расчет')
-        self.assertEqual((row['template_id'], state), ('turnkey_overview', 'location_status'))
+        self.assertEqual((row['template_id'], state), ('turnkey_overview', 'turnkey_details'))
         self.assertEqual(self.model_calls, 0)
 
     async def test_greeting_does_not_override_other_meanings_of_keywords(self):
@@ -212,7 +229,7 @@ class ReplyLogicTests(unittest.IsolatedAsyncioTestCase):
     async def test_installation_city_after_listing_greeting(self):
         await self.turn('Здравствуйте!', title='Уличная кофейня самообслуживания')
         row, state, _ = await self.turn('Добрый день!', 'Казань', model_result={'answered': True})
-        self.assertEqual((row['template_id'], state), ('info_received', CLOSED))
+        self.assertEqual((row['template_id'], state), ('info_received', 'contact_channel'))
         self.assertEqual(self.sent[-1], 'Спасибо за информацию!')
 
     async def test_provided_city_and_explicit_delivery(self):
@@ -220,8 +237,13 @@ class ReplyLogicTests(unittest.IsolatedAsyncioTestCase):
             'Хочу уличный киоск, установка в Казани',
             model_result={'id': 'street_overview', 'already_answered': True},
         )
-        self.assertEqual((row['template_id'], state), ('street_overview', CLOSED))
-        self.assertNotIn('?', self.sent[-1])
+        self.assertEqual((row['template_id'], state), ('street_overview', 'contact_channel'))
+        self.assertNotIn('в каком городе', self.sent[-1])
+        self.assertIn('WhatsApp, Telegram или Max?', self.sent[-1])
+        row, state, _ = await self.turn('В Телеграм')
+        self.assertEqual((row['template_id'], row['status'], state), ('waiting_contact', 'skipped', 'contact_channel'))
+        row, state, _ = await self.turn('coffee_owner')
+        self.assertEqual((row['template_id'], state), ('contact_received', CLOSED))
         await self.turn('Доставите в Казань?', model_result={'id': 'delivery_quote_requested'}, chat='delivery')
         self.assertIn('Уточним стоимость доставки', self.sent[-1])
         row, state, _ = await self.turn(
@@ -308,7 +330,7 @@ class ReplyLogicTests(unittest.IsolatedAsyncioTestCase):
         _, state, _ = await self.turn(
             'Расчёт', chat='legacy', model_result={'id': 'turnkey_overview', 'already_answered': False},
         )
-        self.assertEqual(state, 'location_status')
+        self.assertEqual(state, 'turnkey_details')
         with app.db() as c:
             self.assertIsNotNone(c.execute("SELECT 1 FROM jobs WHERE id='old'").fetchone())
 
