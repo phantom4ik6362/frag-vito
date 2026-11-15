@@ -134,6 +134,12 @@ class ReplyLogicTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((row['template_id'], state), ('handoff', CLOSED))
         self.assertEqual(self.model_calls, 0)
 
+    async def test_installation_city_after_listing_greeting(self):
+        await self.turn('Здравствуйте!', title='Уличная кофейня самообслуживания')
+        row, state, _ = await self.turn('Казань', model_result={'answered': True})
+        self.assertEqual((row['template_id'], state), ('info_received', CLOSED))
+        self.assertEqual(self.sent[-1], 'Спасибо за информацию!')
+
     async def test_provided_city_and_explicit_delivery(self):
         row, state, _ = await self.turn(
             'Хочу уличный киоск, установка в Казани',
@@ -151,7 +157,7 @@ class ReplyLogicTests(unittest.IsolatedAsyncioTestCase):
     async def test_new_topic_during_delivery_wait_cannot_reopen(self):
         await self.turn('Сколько стоит доставка?', model_result={'id': 'clarify_delivery_city'})
         row, state, _ = await self.turn(
-            'Расскажите про уличный киоск', model_result={'id': 'street_overview', 'already_answered': False},
+            'Расскажите про уличный киоск', model_result={'answered': False},
         )
         self.assertEqual((row['template_id'], state), ('handoff', CLOSED))
         await self.turn('Казань')
@@ -159,7 +165,7 @@ class ReplyLogicTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_delivery_city_completes_the_chat(self):
         await self.turn('Сколько стоит доставка?', model_result={'id': 'clarify_delivery_city'})
-        row, state, _ = await self.turn('Павловск, Алтайский край', model_result={'id': 'answer'})
+        row, state, _ = await self.turn('Павловск, Алтайский край', model_result={'answered': True})
         self.assertEqual((row['template_id'], state), ('info_received', CLOSED))
         self.assertEqual(self.sent[-1], 'Спасибо за информацию!')
 
