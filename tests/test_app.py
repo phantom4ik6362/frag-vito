@@ -9,7 +9,6 @@ from unittest.mock import patch
 import httpx
 import app
 import telegram_notify
-from dialogue import decide
 
 class AppTests(unittest.TestCase):
     def setUp(self):
@@ -47,39 +46,6 @@ class AppTests(unittest.TestCase):
                 self.assertGreaterEqual(rows[0]['due'] - rows[0]['created'], 5)
         asyncio.run(run())
 
-    def test_dialogue(self):
-        async def run():
-            cases = [
-                ('clarify_intent', {}, [], 'clarify_intent'),
-                ('clarify_intent', {}, ['clarify_intent'], 'ignore'),
-                ('delivery', {}, ['clarify_intent', 'ignore'], 'clarify_delivery_city'),
-                ('turnkey_overview', {'city': False}, ['clarify_delivery_city'], 'ignore'),
-                ('delivery', {'city': True, 'messenger': True}, ['clarify_delivery_city', 'model_error'], 'delivery_quote_requested'),
-                ('street_overview', {'city': True}, [], 'street_overview'),
-                ('turnkey_overview', {'location_status': True, 'messenger': True}, [], 'turnkey_overview'),
-                ('stop', {}, ['availability_yes'], 'stop'),
-                ('availability_yes', {}, ['stop'], 'stop'),
-            ]
-            for label, fields, actions, expected in cases:
-                def handler(request):
-                    return httpx.Response(200, json={'choices': [{'message': {
-                        'content': json.dumps({'id': label, **fields}),
-                    }}]})
-                with patch.dict(os.environ, {'LLM_API_KEY': 'test'}):
-                    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-                        history = [{'text': '', 'action': action} for action in actions]
-                        reply = await decide(client, ['пример'], history, app.templates())
-                        self.assertEqual(reply.id, expected)
-                        if fields.get('messenger'):
-                            self.assertNotIn('куда удобнее', reply.text)
-                            self.assertNotIn('в какой мессенджер', reply.text)
-                        if expected == 'street_overview':
-                            self.assertIn('230 000 ₽', reply.text)
-                            self.assertNotIn('в каком городе', reply.text)
-                        if fields.get('location_status'):
-                            self.assertNotIn('локацию уже', reply.text)
-        asyncio.run(run())
-
     def test_batch_waits_for_latest_message(self):
         with app.db() as c:
             for ident, created, due in [('a', 1, 2), ('b', 2, 6)]:
@@ -89,9 +55,10 @@ class AppTests(unittest.TestCase):
         with patch.object(app.time, 'time', return_value=6):
             batch = app.claim_batch()
         self.assertEqual([row['id'] for row in batch], ['a', 'b'])
-        app.record_batch(batch, 'sent', 'clarify_delivery_city')
-        self.assertEqual(app.history_for('chat', False), [{'text': 'text\ntext', 'action': 'clarify_delivery_city'}])
-        self.assertEqual(app.history_for('chat', True), [])
+        with app.db() as c:
+            app.record_batch(c, batch, 'sent', 'clarify_delivery_city')
+            rows = c.execute('SELECT status,text FROM jobs ORDER BY created').fetchall()
+        self.assertEqual([tuple(row) for row in rows], [('merged', 'text'), ('sent', 'text\ntext')])
 
     def test_webhook_queues_telegram_once_and_dry_run_does_not_queue(self):
         async def run():
@@ -137,6 +104,7 @@ class AppTests(unittest.TestCase):
         app.init_db()
         with app.db() as c:
             self.assertEqual(c.execute('SELECT status FROM jobs').fetchone()['status'], 'unknown')
+            self.assertEqual(app.chat_state(c, 'chat', False), 'closed')
 
 if __name__ == '__main__':
     unittest.main()

@@ -9,7 +9,7 @@ from urllib.parse import parse_qs
 import httpx
 
 from app import AvitoClient, extract_event, templates
-from dialogue import decide_safely
+from dialogue import CLOSED, decide_safely
 
 TEST_ACCOUNT = "123456"
 TEST_CHAT = "dry-run-chat"
@@ -60,7 +60,7 @@ def mock_avito(request: httpx.Request) -> httpx.Response:
     return httpx.Response(200, json={"id": "dry-run-message", "type": "text"})
 
 
-async def preview(question, llm, avito, history):
+async def preview(question, llm, avito, state, listing_title):
     event = {"payload": {"type": "message", "value": {
         "id": "dry-run-incoming",
         "chat_id": TEST_CHAT,
@@ -72,24 +72,25 @@ async def preview(question, llm, avito, history):
     incoming = extract_event(event, TEST_ACCOUNT)
     if incoming is None:
         print("Введите непустое сообщение до 10 000 символов.")
-        return
+        return state
 
     _, chat_id, text = incoming
     options = templates()
-    reply = await decide_safely(llm, [text], history, options, logging.getLogger(__name__))
+    reply = await decide_safely(
+        llm, [text], state, options, logging.getLogger(__name__), listing_title=listing_title,
+    )
     print(f"\nРешение: {reply.id}")
     if not reply.text:
-        history.append({'text': text, 'action': reply.id})
         print("Автоответ пропущен.\n")
-        return
+        return reply.next_state
     print(f"Ответ: {reply.text}")
     response = await avito.send(chat_id, reply.text)
     if response.is_success:
-        history.append({'text': text, 'action': reply.id})
-    if response.is_success:
         print("Локальная проверка POST: OK (имитация HTTP 200).\n")
+        return reply.next_state
     else:
         print(f"Локальная проверка POST: HTTP {response.status_code}. {response.text}\n")
+        return CLOSED
 
 
 async def main() -> None:
@@ -97,13 +98,14 @@ async def main() -> None:
     if not os.getenv("LLM_API_KEY", "").strip():
         raise SystemExit("Укажите LLM_API_KEY и настройки модели в .env.")
     print("Тестовый CLI. Модель вызывается через API, Avito имитируется локально.")
-    print("Введите сообщение покупателя. Для выхода введите /exit.")
+    print("Введите сообщение покупателя. /new — новый чат. /exit — выход.")
+    listing_title = input("Заголовок объявления (Enter — неизвестен)> ").strip()
     async with (
         httpx.AsyncClient(timeout=20) as llm,
         httpx.AsyncClient(transport=httpx.MockTransport(mock_avito)) as avito_http,
     ):
         avito = AvitoClient(avito_http, TEST_CONFIG)
-        history = []
+        state = None
         while True:
             try:
                 question = input("Покупатель> ").strip()
@@ -111,9 +113,12 @@ async def main() -> None:
                 break
             if question == "/exit":
                 break
+            if question == "/new":
+                state = None
+                continue
             if question:
                 try:
-                    await preview(question, llm, avito, history)
+                    state = await preview(question, llm, avito, state, listing_title)
                 except (OSError, ValueError) as exc:
                     print(f"Ошибка файлов шаблонов или промпта: {exc}")
 

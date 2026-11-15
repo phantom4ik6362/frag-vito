@@ -22,10 +22,17 @@ async def main():
     if args.command in ('pause-chat', 'resume-chat', 'ack-telegram'):
         init_db(recover=False)
         with db() as c:
+            c.execute('BEGIN IMMEDIATE')
             if args.command == 'pause-chat':
                 c.execute('INSERT OR IGNORE INTO manual_chats VALUES (?)', (args.identifier,))
             elif args.command == 'resume-chat':
+                if c.execute(
+                    "SELECT 1 FROM jobs WHERE chat_id=? AND status IN ('pending','processing','sending')",
+                    (args.identifier,),
+                ).fetchone():
+                    raise SystemExit('В чате есть задачи в работе. Повторите после их завершения.')
                 c.execute('DELETE FROM manual_chats WHERE chat_id=?', (args.identifier,))
+                c.execute('DELETE FROM chat_dialogue WHERE chat_id=?', (args.identifier,))
             else:
                 result = c.execute(
                     "UPDATE telegram_jobs SET status='acknowledged' WHERE id=? AND status IN ('failed','unknown')",
@@ -54,6 +61,8 @@ async def main():
     cfg = config()
     if args.command == 'check':
         telegram = telegram_settings()
+        if not dry_run() and not telegram:
+            raise SystemExit('Для боевого режима нужны TELEGRAM_BOT_TOKEN и TELEGRAM_CHAT_ID.')
         print('Настройки и шаблоны прочитаны. ID:', ', '.join(templates()))
         print('DRY_RUN:', dry_run())
         print('Telegram:', 'настроен' if telegram else 'отключён')
