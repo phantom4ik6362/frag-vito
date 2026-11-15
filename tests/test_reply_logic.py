@@ -33,6 +33,7 @@ class ReplyLogicTests(unittest.IsolatedAsyncioTestCase):
         app.init_db()
         self.model_answer = None
         self.model_calls = 0
+        self.listing_calls = 0
         self.sent = []
         self.message_number = 0
 
@@ -63,7 +64,8 @@ class ReplyLogicTests(unittest.IsolatedAsyncioTestCase):
             return httpx.Response(status, json={'id': outgoing})
 
         class Avito:
-            async def listing_title(self, _):
+            async def listing_title(api, _):
+                self.listing_calls += 1
                 return title
 
         api = Avito()
@@ -100,7 +102,7 @@ class ReplyLogicTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_placement_question_does_not_start_delivery(self):
         await self.turn('Расчёт', model_result={'id': 'turnkey_overview', 'already_answered': False})
-        row, state, _ = await self.turn('Казань, ЖК Светлая долина или ЖК Весна, где можно?')
+        row, state, _ = await self.turn('Казань, ЖК Светлая долина или ЖК Весна, где можно?', model_result={'answered': False})
         self.assertEqual((row['template_id'], state), ('handoff', CLOSED))
         await self.turn(PHONE)
         await self.turn('Выше написала')
@@ -134,6 +136,35 @@ class ReplyLogicTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((row['template_id'], state), ('handoff', CLOSED))
         self.assertEqual(self.model_calls, 0)
 
+    async def test_colloquial_greeting_gets_listing_overview(self):
+        for index, message in enumerate(('Драстье!', 'дравствуйте!', 'Доброго дня 👋')):
+            with self.subTest(message=message):
+                row, state, _ = await self.turn(
+                    message, title='Уличная кофейня самообслуживания', chat=f'u2i-hello-{index}',
+                )
+                self.assertEqual((row['template_id'], state), ('street_overview', 'installation_city'))
+        self.assertEqual(self.model_calls, 0)
+        self.assertEqual(self.listing_calls, 3)
+
+    async def test_greeting_classified_by_model_gets_listing_overview(self):
+        row, state, _ = await self.turn(
+            'Здаровеньки', model_result={'id': 'greeting', 'already_answered': False},
+            title='Уличная кофейня самообслуживания',
+        )
+        self.assertEqual((row['template_id'], state), ('street_overview', 'installation_city'))
+        self.assertEqual(self.model_calls, 1)
+        self.assertEqual(self.listing_calls, 1)
+
+    async def test_colloquial_greeting_with_question_keeps_question_intent(self):
+        for index, messages in enumerate((('Драстье, скока доставка?',), ('Драстье!', 'Скока доставка?'))):
+            with self.subTest(messages=messages):
+                row, state, _ = await self.turn(
+                    *messages, model_result={'id': 'clarify_delivery_city'}, chat=f'u2i-delivery-{index}',
+                )
+                self.assertEqual((row['template_id'], state), ('clarify_delivery_city', 'delivery_destination'))
+        self.assertEqual(self.model_calls, 2)
+        self.assertEqual(self.listing_calls, 0)
+
     async def test_installation_city_after_listing_greeting(self):
         await self.turn('Здравствуйте!', title='Уличная кофейня самообслуживания')
         row, state, _ = await self.turn('Казань', model_result={'answered': True})
@@ -150,7 +181,7 @@ class ReplyLogicTests(unittest.IsolatedAsyncioTestCase):
         await self.turn('Доставите в Казань?', model_result={'id': 'delivery_quote_requested'}, chat='delivery')
         self.assertIn('Уточним стоимость доставки', self.sent[-1])
         row, state, _ = await self.turn(
-            'Казань, локацию не нашли ещё', model_result={'id': 'delivery_quote_requested'}, chat='bad-route',
+            'Казань, локацию не нашли ещё', model_result={'id': 'handoff'}, chat='bad-route',
         )
         self.assertEqual((row['template_id'], state), ('handoff', CLOSED))
 
@@ -168,6 +199,30 @@ class ReplyLogicTests(unittest.IsolatedAsyncioTestCase):
         row, state, _ = await self.turn('Павловск, Алтайский край', model_result={'answered': True})
         self.assertEqual((row['template_id'], state), ('info_received', CLOSED))
         self.assertEqual(self.sent[-1], 'Спасибо за информацию!')
+
+    async def test_delivery_can_be_classified_without_exact_keywords(self):
+        for index, (text, action) in enumerate((
+            ('дост.', 'clarify_delivery_city'),
+            ('дост. в мсква', 'delivery_quote_requested'),
+            ('Возите в азань?', 'delivery_quote_requested'),
+        )):
+            with self.subTest(text=text):
+                row, _, _ = await self.turn(text, model_result={'id': action}, chat=f'u2i-short-{index}')
+                self.assertEqual((row['template_id'], row['status']), (action, 'sent'))
+
+    async def test_followup_accepts_misspelled_city_without_inventing_a_name(self):
+        for index, text in enumerate(('азань', 'мсква?')):
+            with self.subTest(text=text):
+                chat = f'u2i-city-{index}'
+                await self.turn('дост.', model_result={'id': 'clarify_delivery_city'}, chat=chat)
+                row, state, _ = await self.turn(text, model_result={'answered': True}, chat=chat)
+                self.assertEqual((row['template_id'], state), ('info_received', CLOSED))
+                self.assertEqual(self.sent[-1], 'Спасибо за информацию!')
+                with app.db() as connection:
+                    stored = connection.execute(
+                        'SELECT text FROM jobs WHERE chat_id=? AND template_id=?', (chat, 'info_received'),
+                    ).fetchone()
+                self.assertEqual(stored['text'], text)
 
     async def test_phone_fragments_and_price_question(self):
         row, state, _ = await self.turn('918', '9800001')
