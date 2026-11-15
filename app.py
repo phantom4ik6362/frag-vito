@@ -8,7 +8,6 @@ import secrets
 import sqlite3
 import time
 from contextlib import asynccontextmanager
-from functools import partial
 from pathlib import Path
 from urllib.parse import quote
 
@@ -224,20 +223,6 @@ class AvitoClient:
             r = await self.client.request(method, AVITO + path, headers={'Authorization': 'Bearer ' + token}, **kwargs)
         return r
 
-    async def listing_title(self, chat):
-        path = f"/messenger/v2/accounts/{self.cfg['AVITO_USER_ID']}/chats/{quote(chat, safe='')}"
-        try:
-            response = await self.request('GET', path, timeout=5)
-            response.raise_for_status()
-            details = response.json()
-        except (httpx.HTTPError, ValueError, KeyError, TypeError) as exc:
-            log.warning('Не удалось получить объявление для чата %r (%s)', chat, type(exc).__name__)
-            return ''
-        context = details.get('context') if isinstance(details, dict) else None
-        value = context.get('value') if isinstance(context, dict) else None
-        title = value.get('title') if isinstance(value, dict) else None
-        return title[:500] if isinstance(title, str) else ''
-
     async def send(self, chat, text):
         path = f"/messenger/v1/accounts/{self.cfg['AVITO_USER_ID']}/chats/{quote(chat, safe='')}/messages"
         return await self.request('POST', path, json={'type': 'text', 'message': {'text': text}})
@@ -301,13 +286,7 @@ async def process_batch(client, api, batch):
             return
 
     messages = [row['text'][:3000] for row in batch]
-    # Resolve the title only after a greeting is detected.
-    get_listing_title = None
-    if state is None and not preview and chat.startswith('u2i-'):
-        get_listing_title = partial(api.listing_title, chat)
-    reply = await decide_safely(
-        client, messages, state, templates(), log, get_listing_title=get_listing_title,
-    )
+    reply = await decide_safely(client, messages, state, templates(), log)
     with db() as c:
         c.execute('BEGIN IMMEDIATE')
         if is_manual(c, chat):

@@ -23,6 +23,7 @@ NEW_ACTIONS = set(INTRO_QUESTIONS) | {
     'availability_yes', 'clarify_delivery_city', 'delivery_quote_requested', 'greeting', 'handoff',
 }
 CLOSED = 'closed'
+GREETED = 'greeted'
 WAITING_QUESTIONS = {
     state: question for state, question in INTRO_QUESTIONS.values()
 } | {'delivery_destination': 'В какой город или населённый пункт нужна доставка?'}
@@ -134,15 +135,6 @@ def keyword_action(messages):
     return next((action for pattern, action in KEYWORD_REQUESTS if pattern.fullmatch(text)), None)
 
 
-def listing_intro(title):
-    title = title.casefold().replace('ё', 'е')
-    if re.search(r'\b(?:уличн\w*\s+кофейн\w*|киоск\w*|павильон\w*)\b', title):
-        return 'street_overview'
-    if re.search(r'\bкофейн\w*\b', title) and re.search(r'\bпод\s+ключ\b', title):
-        return 'turnkey_overview'
-    return None
-
-
 def has_contact(messages, *, expecting_contact=False):
     # Do not join two separate digit fragments into a phone number.
     if any(NO_CONTACT.search(text.casefold()) for text in messages):
@@ -192,14 +184,14 @@ def render(action, options, already_answered=False, welcome=False):
     return Reply(action, text, next_state)
 
 
-async def reply_to_greeting(options, listing_title, get_listing_title):
-    if not listing_title and get_listing_title is not None:
-        listing_title = await get_listing_title()
-    intro = listing_intro(listing_title)
-    return render(intro, options, welcome=True) if intro else Reply('handoff')
+def reply_to_greeting(state, options):
+    if state is not None:
+        return Reply('repeated_greeting', next_state=state)
+    text = options.get('clarify_intent') or 'Здравствуйте! Подскажите, пожалуйста, что вас интересует?'
+    return Reply('clarify_intent', text, GREETED)
 
 
-async def decide(client, messages, state, options, model=None, listing_title='', *, get_listing_title=None):
+async def decide(client, messages, state, options, model=None):
     if state == CLOSED:
         return Reply('closed')
     if not messages:
@@ -208,26 +200,27 @@ async def decide(client, messages, state, options, model=None, listing_title='',
     if has_contact(messages, expecting_contact=state in CONTACT_STATES):
         return render('contact_received', options)
     if not messages:
-        if state is not None:
-            return Reply('handoff')
-        return await reply_to_greeting(options, listing_title, get_listing_title)
+        return reply_to_greeting(state, options)
     action = keyword_action(messages)
     if action is not None:
+        if action in FULL_INTROS and state == FULL_INTROS[action][0]:
+            return Reply('already_replied', next_state=state)
         return render(action, options, welcome=state is None)
 
+    initial_request = state in (None, GREETED)
     normalized = ' '.join(' '.join(messages).casefold().split())
     if state in CONTACT_STATES and CHANNEL_ONLY.fullmatch(normalized.strip(' .,!;')):
         return Reply('waiting_contact', next_state='contact_channel')
     if all(re.fullmatch(r'[0-9\s()+.-]+', text) for text in messages):
         return Reply('handoff')
-    if state is not None and AMBIGUOUS_FOLLOWUP.fullmatch(normalized):
+    if not initial_request and AMBIGUOUS_FOLLOWUP.fullmatch(normalized):
         return Reply('handoff')
     if state in {'location_status', 'turnkey_details'} and LOCATION_REPLY.fullmatch(normalized):
         next_state = 'contact_channel' if state == 'turnkey_details' else CLOSED
         return Reply('info_received', options['info_received'], next_state)
 
     payload = {'messages': messages}
-    if state is None:
+    if initial_request:
         system_prompt = (BASE / 'prompt.txt').read_text(encoding='utf-8')
     else:
         system_prompt = FOLLOWUP_PROMPT
@@ -257,7 +250,7 @@ async def decide(client, messages, state, options, model=None, listing_title='',
     if not isinstance(result, dict):
         raise ValueError('decision_not_object')
 
-    if state is not None:
+    if not initial_request:
         answered = result.get('answered')
         if type(answered) is not bool:
             raise ValueError('decision_answered_missing_or_invalid')
@@ -272,23 +265,22 @@ async def decide(client, messages, state, options, model=None, listing_title='',
     if not isinstance(selected, str) or selected not in NEW_ACTIONS:
         raise ValueError('decision_unknown_action')
     if selected == 'greeting':
-        return await reply_to_greeting(options, listing_title, get_listing_title)
+        return reply_to_greeting(state, options)
     if selected == 'handoff':
         return Reply('handoff')
     already_answered = result.get('already_answered')
     if selected in INTRO_QUESTIONS and type(already_answered) is not bool:
         raise ValueError('decision_already_answered_missing_or_invalid')
-    return render(selected, options, already_answered is True, welcome=True)
+    return render(selected, options, already_answered is True, welcome=state is None)
 
 
-async def decide_safely(client, messages, state, options, log, listing_title='', *, get_listing_title=None):
+async def decide_safely(client, messages, state, options, log):
     fallback = os.getenv('LLM_FALLBACK_MODEL', '').strip()
     for attempt in range(2):
         retry_after = ''
         try:
             return await decide(client, messages, state, options,
-                                model=fallback if attempt and fallback else None,
-                                listing_title=listing_title, get_listing_title=get_listing_title)
+                                model=fallback if attempt and fallback else None)
         except httpx.HTTPStatusError as exc:
             status = exc.response.status_code
             log.warning('API модели вернул HTTP %s (попытка %s)', status, attempt + 1)

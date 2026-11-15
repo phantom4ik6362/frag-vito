@@ -60,7 +60,7 @@ def mock_avito(request: httpx.Request) -> httpx.Response:
     return httpx.Response(200, json={"id": "dry-run-message", "type": "text"})
 
 
-async def preview(question, llm, avito, state, listing_title):
+async def preview(question, llm, avito, state):
     event = {"payload": {"type": "message", "value": {
         "id": "dry-run-incoming",
         "chat_id": TEST_CHAT,
@@ -77,7 +77,7 @@ async def preview(question, llm, avito, state, listing_title):
     _, chat_id, text = incoming
     options = templates()
     reply = await decide_safely(
-        llm, [text], state, options, logging.getLogger(__name__), listing_title=listing_title,
+        llm, [text], state, options, logging.getLogger(__name__),
     )
     print(f"\nРешение: {reply.id}")
     if not reply.text:
@@ -99,7 +99,6 @@ async def main() -> None:
         raise SystemExit("Укажите LLM_API_KEY и настройки модели в .env.")
     print("Тестовый CLI. Модель вызывается через API, Avito имитируется локально.")
     print("Введите сообщение покупателя. /new — новый чат. /exit — выход.")
-    listing_title = input("Заголовок объявления (Enter — неизвестен)> ").strip()
     async with (
         httpx.AsyncClient(timeout=20) as llm,
         httpx.AsyncClient(transport=httpx.MockTransport(mock_avito)) as avito_http,
@@ -118,7 +117,7 @@ async def main() -> None:
                 continue
             if question:
                 try:
-                    state = await preview(question, llm, avito, state, listing_title)
+                    state = await preview(question, llm, avito, state)
                 except (OSError, ValueError) as exc:
                     print(f"Ошибка файлов шаблонов или промпта: {exc}")
 

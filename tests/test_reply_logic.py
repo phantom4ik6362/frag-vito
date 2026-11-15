@@ -143,33 +143,27 @@ class ReplyLogicTests(unittest.IsolatedAsyncioTestCase):
         await self.turn('Алтайский край, Павловский район, с. Павловск', chat='mixed')
         self.assertEqual(len(self.sent), 1)
 
-    async def test_greeting_uses_the_full_listing_template(self):
-        row, state, _ = await self.turn('Здравствуйте!', title='Уличная кофейня самообслуживания')
-        self.assertEqual((row['template_id'], state), ('street_overview', 'street_details'))
-        self.assertEqual(self.sent[-1].count('?'), 2)
-        self.assertIn('230 000 ₽', self.sent[-1])
-        row, state, _ = await self.turn('Здравствуйте!', title='Оборудование', chat='other')
-        self.assertEqual((row['template_id'], state), ('handoff', CLOSED))
-        self.assertEqual(self.model_calls, 0)
+    async def test_greeting_asks_neutral_question(self):
+        row, state, _ = await self.turn('Здравствуйте!')
+        self.assertEqual((row['template_id'], state), ('clarify_intent', 'greeted'))
+        self.assertIn('что вас интересует', self.sent[-1].lower())
+        row, state, _ = await self.turn('Добрый день!')
+        self.assertEqual((row['status'], state), ('skipped', 'greeted'))
+        self.assertEqual(len(self.sent), 1)
 
-    async def test_colloquial_greeting_gets_listing_overview(self):
-        for index, message in enumerate(('Драстье!', 'дравствуйте!', 'Доброго дня 👋')):
+    async def test_colloquial_greeting_gets_neutral_question(self):
+        for n, message in enumerate(('Драстье!', 'дравствуйте!', 'Доброго дня 👋')):
             with self.subTest(message=message):
-                row, state, _ = await self.turn(
-                    message, title='Уличная кофейня самообслуживания', chat=f'u2i-hello-{index}',
-                )
-                self.assertEqual((row['template_id'], state), ('street_overview', 'street_details'))
+                row, state, _ = await self.turn(message, chat=f'u2i-hello-{n}')
+                self.assertEqual((row['template_id'], state), ('clarify_intent', 'greeted'))
         self.assertEqual(self.model_calls, 0)
-        self.assertEqual(self.listing_calls, 3)
 
-    async def test_greeting_classified_by_model_gets_listing_overview(self):
+    async def test_model_greeting_gets_neutral_question(self):
         row, state, _ = await self.turn(
             'Моё почтение!', model_result={'id': 'greeting', 'already_answered': False},
-            title='Уличная кофейня самообслуживания',
         )
-        self.assertEqual((row['template_id'], state), ('street_overview', 'street_details'))
+        self.assertEqual((row['template_id'], state), ('clarify_intent', 'greeted'))
         self.assertEqual(self.model_calls, 1)
-        self.assertEqual(self.listing_calls, 1)
 
     async def test_colloquial_greeting_with_question_keeps_question_intent(self):
         for index, messages in enumerate((('Драстье, скока доставка?',), ('Драстье!', 'Скока доставка?'))):
@@ -202,12 +196,17 @@ class ReplyLogicTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.model_calls, 0)
         self.assertEqual(self.listing_calls, 0)
 
-    async def test_keyword_works_after_bot_has_answered_greeting(self):
-        await self.turn('Добрый день!', title='Кофейня под ключ')
-        row, state, _ = await self.turn('улица')
+    async def test_street_reply_is_sent_once_after_greeting(self):
+        await self.turn('Добрый день!')
+        app.init_db()
+        row, state, _ = await self.turn('Улица')
         self.assertEqual((row['template_id'], state), ('street_overview', 'street_details'))
-        self.assertFalse(self.sent[-1].startswith(('Здравствуйте', 'Добрый день')))
-        row, state, _ = await self.turn('расчет')
+        self.assertFalse(self.sent[-1].startswith(('Добрый день', 'Здравствуйте')))
+        row, state, _ = await self.turn('Улица')
+        self.assertEqual((row['template_id'], row['status'], state),
+                         ('already_replied', 'skipped', 'street_details'))
+        self.assertEqual(len(self.sent), 2)
+        row, state, _ = await self.turn('Расчёт')
         self.assertEqual((row['template_id'], state), ('turnkey_overview', 'turnkey_details'))
         self.assertEqual(self.model_calls, 0)
 
@@ -226,8 +225,8 @@ class ReplyLogicTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.model_calls, 4)
         self.assertEqual(self.listing_calls, 0)
 
-    async def test_installation_city_after_listing_greeting(self):
-        await self.turn('Здравствуйте!', title='Уличная кофейня самообслуживания')
+    async def test_installation_city_after_explicit_street_request(self):
+        await self.turn('Здравствуйте!', 'улица')
         row, state, _ = await self.turn('Добрый день!', 'Казань', model_result={'answered': True})
         self.assertEqual((row['template_id'], state), ('info_received', 'contact_channel'))
         self.assertEqual(self.sent[-1], 'Спасибо за информацию!')
@@ -340,13 +339,9 @@ class ReplyLogicTests(unittest.IsolatedAsyncioTestCase):
         await self.turn(PHONE)
         self.assertEqual(self.sent, [])
 
-    async def test_listing_lookup_shape(self):
-        def backend(request):
-            if request.url.path == '/token':
-                return httpx.Response(200, json={'access_token': 'test'})
-            self.assertEqual(request.url.path, f'/messenger/v2/accounts/123/chats/{CHAT}')
-            return httpx.Response(200, json={'context': {'type': 'item', 'value': {'title': 'Киоск'}}})
-
-        async with httpx.AsyncClient(transport=httpx.MockTransport(backend)) as client:
-            api = app.AvitoClient(client, {'AVITO_USER_ID': '123', 'AVITO_CLIENT_ID': 'x', 'AVITO_CLIENT_SECRET': 'x'})
-            self.assertEqual(await api.listing_title(CHAT), 'Киоск')
+    async def test_delivery_after_neutral_greeting(self):
+        await self.turn('Добрый день!')
+        row, state, _ = await self.turn(
+            'Сколько стоит доставка?', model_result={'id': 'clarify_delivery_city'},
+        )
+        self.assertEqual((row['template_id'], state), ('clarify_delivery_city', 'delivery_destination'))
