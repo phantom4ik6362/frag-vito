@@ -10,6 +10,7 @@ import httpx
 log = logging.getLogger('avito-bot.telegram')
 UNFINISHED = ('pending', 'processing', 'sending')
 SENT_ACTIONS = {
+    'city_received': 'Покупатель указал город. Подготовьте расчёт и свяжитесь с ним.',
     'contact_received': 'Поблагодарил за контакт. Продолжите общение с покупателем.',
     'info_received': 'Подтвердил получение информации. Продолжите переписку при необходимости.',
     'street_quote': 'Покупатель просит расчёт для уличного киоска. Нужно подготовить предложение.',

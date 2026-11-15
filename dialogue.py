@@ -17,7 +17,7 @@ INTRO_QUESTIONS = {
 }
 REQUIRED = set(INTRO_QUESTIONS) | {
     'availability_yes', 'clarify_delivery_city', 'delivery_quote_requested',
-    'contact_received', 'info_received',
+    'contact_received', 'info_received', 'city_received',
 }
 NEW_ACTIONS = set(INTRO_QUESTIONS) | {
     'availability_yes', 'clarify_delivery_city', 'delivery_quote_requested', 'greeting', 'handoff',
@@ -258,7 +258,10 @@ async def decide(client, messages, state, options, model=None):
             if state == 'contact_channel':
                 return Reply('waiting_contact', next_state=state)
             next_state = 'contact_channel' if state in CONTACT_STATES else CLOSED
-            return Reply('info_received', options['info_received'], next_state)
+            action = 'city_received' if state in {
+                'delivery_destination', 'installation_city', 'street_details',
+            } else 'info_received'
+            return Reply(action, options[action], next_state)
         return Reply('handoff')
 
     selected = result.get('id')

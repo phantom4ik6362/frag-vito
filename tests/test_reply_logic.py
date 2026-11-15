@@ -99,7 +99,7 @@ class ReplyLogicTests(unittest.IsolatedAsyncioTestCase):
         row, state, _ = await self.turn(f'{PHONE} Макс')
         self.assertEqual((row['template_id'], state), ('contact_received', CLOSED))
         self.assertEqual(len(self.sent), 3)
-        self.assertEqual(self.sent[-1], 'Спасибо за контакт! Свяжемся с вами.')
+        self.assertEqual(self.sent[-1], 'Спасибо большое! Мы свяжемся с вами по указанному контакту.')
         reports = [telegram_notify.claim_report(app.db, float('inf'), 0) for _ in range(3)]
         self.assertIn(PHONE, reports[-1][1])
         self.assertIn('Поблагодарил за контакт', reports[-1][1])
@@ -116,7 +116,7 @@ class ReplyLogicTests(unittest.IsolatedAsyncioTestCase):
         await self.turn('Расчёт')
         row, state, _ = await self.turn('Город Казань, локацию не нашли ещё', PHONE)
         self.assertEqual((row['template_id'], state), ('contact_received', CLOSED))
-        self.assertEqual(self.sent[-1], 'Спасибо за контакт! Свяжемся с вами.')
+        self.assertEqual(self.sent[-1], 'Спасибо большое! Мы свяжемся с вами по указанному контакту.')
         self.assertEqual(self.model_calls, 0)
 
     async def test_messenger_then_nickname_is_acknowledged(self):
@@ -128,7 +128,7 @@ class ReplyLogicTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual((row['template_id'], state), ('waiting_contact', 'contact_channel'))
                 row, state, _ = await self.turn(nickname, chat=chat)
                 self.assertEqual((row['template_id'], state), ('contact_received', CLOSED))
-                self.assertEqual(self.sent[-1], 'Спасибо за контакт! Свяжемся с вами.')
+                self.assertEqual(self.sent[-1], 'Спасибо большое! Мы свяжемся с вами по указанному контакту.')
         self.assertEqual(self.model_calls, 0)
 
     async def test_callback_with_contact_and_mixed_delivery(self):
@@ -228,8 +228,8 @@ class ReplyLogicTests(unittest.IsolatedAsyncioTestCase):
     async def test_installation_city_after_explicit_street_request(self):
         await self.turn('Здравствуйте!', 'улица')
         row, state, _ = await self.turn('Добрый день!', 'Казань', model_result={'answered': True})
-        self.assertEqual((row['template_id'], state), ('info_received', 'contact_channel'))
-        self.assertEqual(self.sent[-1], 'Спасибо за информацию!')
+        self.assertEqual((row['template_id'], state), ('city_received', 'contact_channel'))
+        self.assertEqual(self.sent[-1], 'Спасибо! Подготовим для вас расчёт и свяжемся с вами.')
 
     async def test_provided_city_and_explicit_delivery(self):
         row, state, _ = await self.turn(
@@ -262,8 +262,8 @@ class ReplyLogicTests(unittest.IsolatedAsyncioTestCase):
     async def test_delivery_city_completes_the_chat(self):
         await self.turn('Сколько стоит доставка?', model_result={'id': 'clarify_delivery_city'})
         row, state, _ = await self.turn('Павловск, Алтайский край', model_result={'answered': True})
-        self.assertEqual((row['template_id'], state), ('info_received', CLOSED))
-        self.assertEqual(self.sent[-1], 'Спасибо за информацию!')
+        self.assertEqual((row['template_id'], state), ('city_received', CLOSED))
+        self.assertEqual(self.sent[-1], 'Спасибо! Подготовим для вас расчёт и свяжемся с вами.')
 
     async def test_delivery_can_be_classified_without_exact_keywords(self):
         for index, (text, action) in enumerate((
@@ -281,11 +281,11 @@ class ReplyLogicTests(unittest.IsolatedAsyncioTestCase):
                 chat = f'u2i-city-{index}'
                 await self.turn('дост.', model_result={'id': 'clarify_delivery_city'}, chat=chat)
                 row, state, _ = await self.turn(text, model_result={'answered': True}, chat=chat)
-                self.assertEqual((row['template_id'], state), ('info_received', CLOSED))
-                self.assertEqual(self.sent[-1], 'Спасибо за информацию!')
+                self.assertEqual((row['template_id'], state), ('city_received', CLOSED))
+                self.assertEqual(self.sent[-1], 'Спасибо! Подготовим для вас расчёт и свяжемся с вами.')
                 with app.db() as connection:
                     stored = connection.execute(
-                        'SELECT text FROM jobs WHERE chat_id=? AND template_id=?', (chat, 'info_received'),
+                        'SELECT text FROM jobs WHERE chat_id=? AND template_id=?', (chat, 'city_received'),
                     ).fetchone()
                 self.assertEqual(stored['text'], text)
 
