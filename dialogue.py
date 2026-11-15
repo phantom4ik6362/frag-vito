@@ -51,10 +51,27 @@ NO_CONTACT = re.compile(
     r'|(?:не мой|чужой) номер)\b'
 )
 MONEY = re.compile(r'₽|\b(?:руб\w*|цен[аыуе]|стоимост\w*|бюджет\w*|артикул\w*|объявление\s*№)\b')
-GREETING = re.compile(
+GREETING_WORDS = (
     r'(?:[зс]?дра(?:в)?ст(?:вуй(?:те)?|у(?:й|йте)|[еи]|ь(?:е|те))'
-    r'|привет(?:ствую|ик)?|добр(?:ый (?:день|вечер)|ое утро|ого (?:дня|вечера|утра)))'
-    r'[\s!.,🙂👋]*'
+    r'|привет(?:ствую|ик)?|добр(?:ый (?:день|вечер)|ое утро|ого (?:дня|вечера|утра))'
+    r'|здаров(?:а|еньки)|хай|салют)'
+)
+GREETING_PREFIX = re.compile(rf'^(?:{GREETING_WORDS}(?!\w)[\s!.,:;?🙂👋—–-]*)+', re.IGNORECASE)
+GREETING_SUFFIX = re.compile(rf'([!.,:;?—–-]\s*){GREETING_WORDS}[\s!.,🙂👋]*$', re.IGNORECASE)
+
+# Match the whole request, so addresses and questions about delivery keep their own meaning.
+REQUEST_PREFIX = (
+    r'(?:(?:можно|пожалуйста|хочу|хотим|хотел[аи]? бы|мне|нужен|нужна|нужно|интересует|'
+    r'дайте|пришлите|скиньте|сделайте|расскажите(?: (?:про|о|об))?) )*'
+)
+STREET_REQUEST = r'(?:улиц[ауы]|уличн(?:ая|ую|ый|ое|ые|ого|ой|ых|ому|ым|ом)(?: (?:кофейн\w*|киоск\w*|павильон\w*))?)'
+QUOTE_REQUEST = r'(?:расчет(?: стоимости)?|рассчитайте|посчитайте)'
+KEYWORD_REQUESTS = (
+    (re.compile(rf'{REQUEST_PREFIX}(?:{QUOTE_REQUEST}(?: (?:для|по))? {STREET_REQUEST}|'
+                rf'{STREET_REQUEST} {REQUEST_PREFIX}{QUOTE_REQUEST})(?: пожалуйста)?'), 'street_quote'),
+    (re.compile(rf'{REQUEST_PREFIX}{STREET_REQUEST}(?: пожалуйста)?'), 'street_overview'),
+    (re.compile(rf'{REQUEST_PREFIX}{QUOTE_REQUEST}(?: кофейни)?(?: под ключ)?'
+                rf'(?: нужен| пожалуйста)*'), 'turnkey_overview'),
 )
 AMBIGUOUS_FOLLOWUP = re.compile(
     r'(?:да|нет|ага|угу|ок(?:ей)?|спасибо|понятно|актуально|здравствуйте|привет)[\s!.,?]*'
@@ -75,8 +92,20 @@ class Reply:
     next_state: str = CLOSED
 
 
-def first_greeting(messages):
-    return bool(messages and all(GREETING.fullmatch(' '.join(text.casefold().split())) for text in messages))
+def strip_greetings(messages):
+    content = []
+    for text in messages:
+        text = GREETING_PREFIX.sub('', ' '.join(text.split()))
+        text = GREETING_SUFFIX.sub(r'\1', text).strip()
+        if text:
+            content.append(text)
+    return content
+
+
+def keyword_action(messages):
+    text = ' '.join(messages).casefold().replace('ё', 'е')
+    text = ' '.join(re.sub(r'[,!.?;:—–/+«»"🙂👋-]', ' ', text).split())
+    return next((action for pattern, action in KEYWORD_REQUESTS if pattern.fullmatch(text)), None)
 
 
 def listing_intro(title):
@@ -135,10 +164,14 @@ async def decide(client, messages, state, options, model=None, listing_title='',
         return Reply('handoff')
     if has_contact(messages):
         return render('contact_received', options)
-    if first_greeting(messages):
+    messages = strip_greetings(messages)
+    if not messages:
         if state is not None:
             return Reply('handoff')
         return await reply_to_greeting(options, listing_title, get_listing_title)
+    action = keyword_action(messages)
+    if action is not None:
+        return render(action, options, welcome=state is None)
 
     normalized = ' '.join(' '.join(messages).casefold().split())
     if all(re.fullmatch(r'[0-9\s()+.-]+', text) for text in messages):

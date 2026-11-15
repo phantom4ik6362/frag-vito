@@ -33,12 +33,15 @@ class ReplyLogicTests(unittest.IsolatedAsyncioTestCase):
         app.init_db()
         self.model_answer = None
         self.model_calls = 0
+        self.model_messages = []
         self.listing_calls = 0
         self.sent = []
         self.message_number = 0
 
     def model(self, request):
         self.model_calls += 1
+        payload = json.loads(request.content)
+        self.model_messages.append(json.loads(payload['messages'][-1]['content'])['messages'])
         self.assertIsNotNone(self.model_answer, 'Unexpected model call')
         if isinstance(self.model_answer, int):
             return httpx.Response(self.model_answer)
@@ -101,7 +104,7 @@ class ReplyLogicTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('для продавца', reports[-1][1])
 
     async def test_placement_question_does_not_start_delivery(self):
-        await self.turn('Расчёт', model_result={'id': 'turnkey_overview', 'already_answered': False})
+        await self.turn('Расчёт')
         row, state, _ = await self.turn('Казань, ЖК Светлая долина или ЖК Весна, где можно?', model_result={'answered': False})
         self.assertEqual((row['template_id'], state), ('handoff', CLOSED))
         await self.turn(PHONE)
@@ -109,11 +112,11 @@ class ReplyLogicTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.sent), 1)
 
     async def test_contact_and_location_in_same_batch(self):
-        await self.turn('Расчёт', model_result={'id': 'turnkey_overview', 'already_answered': False})
+        await self.turn('Расчёт')
         row, state, _ = await self.turn('Город Казань, локацию не нашли ещё', PHONE)
         self.assertEqual((row['template_id'], state), ('contact_received', CLOSED))
         self.assertEqual(self.sent[-1], 'Спасибо за контакт! Свяжемся с вами.')
-        self.assertEqual(self.model_calls, 1)
+        self.assertEqual(self.model_calls, 0)
 
     async def test_callback_with_contact_and_mixed_delivery(self):
         row, state, _ = await self.turn(f'Интересна франшиза. Перезвоните, пожалуйста: {PHONE}')
@@ -148,7 +151,7 @@ class ReplyLogicTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_greeting_classified_by_model_gets_listing_overview(self):
         row, state, _ = await self.turn(
-            'Здаровеньки', model_result={'id': 'greeting', 'already_answered': False},
+            'Моё почтение!', model_result={'id': 'greeting', 'already_answered': False},
             title='Уличная кофейня самообслуживания',
         )
         self.assertEqual((row['template_id'], state), ('street_overview', 'installation_city'))
@@ -162,12 +165,53 @@ class ReplyLogicTests(unittest.IsolatedAsyncioTestCase):
                     *messages, model_result={'id': 'clarify_delivery_city'}, chat=f'u2i-delivery-{index}',
                 )
                 self.assertEqual((row['template_id'], state), ('clarify_delivery_city', 'delivery_destination'))
-        self.assertEqual(self.model_calls, 2)
+        self.assertEqual(self.model_messages, [['скока доставка?'], ['Скока доставка?']])
+        self.assertEqual(self.listing_calls, 0)
+
+    async def test_core_keywords_work_with_or_without_greeting(self):
+        for index, (messages, expected) in enumerate((
+            (('Улица',), 'street_overview'),
+            (('Расчёт',), 'turnkey_overview'),
+            (('Добрый день!', 'улица'), 'street_overview'),
+            (('добрый день!', 'РАСЧЕТ!'), 'turnkey_overview'),
+            (('Здравствуйте, можно расчёт, пожалуйста?',), 'turnkey_overview'),
+            (('Улица, добрый день!',), 'street_overview'),
+            (('Добрый день, расскажите про уличный киоск',), 'street_overview'),
+            (('Привет!', 'улица', 'расчет'), 'street_quote'),
+        )):
+            with self.subTest(messages=messages):
+                row, _, _ = await self.turn(*messages, chat=f'u2i-command-{index}')
+                self.assertEqual((row['template_id'], row['status']), (expected, 'sent'))
+        self.assertEqual(self.model_calls, 0)
+        self.assertEqual(self.listing_calls, 0)
+
+    async def test_keyword_works_after_bot_has_answered_greeting(self):
+        await self.turn('Добрый день!', title='Кофейня под ключ')
+        row, state, _ = await self.turn('улица')
+        self.assertEqual((row['template_id'], state), ('street_overview', 'installation_city'))
+        self.assertNotIn('Здравствуйте', self.sent[-1])
+        row, state, _ = await self.turn('расчет')
+        self.assertEqual((row['template_id'], state), ('turnkey_overview', 'location_status'))
+        self.assertEqual(self.model_calls, 0)
+
+    async def test_greeting_does_not_override_other_meanings_of_keywords(self):
+        for index, (text, expected) in enumerate((
+            ('Добрый день! Улица Ленина, дом 5', 'handoff'),
+            ('Здравствуйте, расчёт доставки в Казань', 'delivery_quote_requested'),
+            ('Привет! Расчёт не нужен', 'handoff'),
+            ('Здравствуйте! Ещё актуально?', 'availability_yes'),
+        )):
+            with self.subTest(text=text):
+                row, _, _ = await self.turn(
+                    text, model_result={'id': expected}, chat=f'u2i-context-{index}',
+                )
+                self.assertEqual(row['template_id'], expected)
+        self.assertEqual(self.model_calls, 4)
         self.assertEqual(self.listing_calls, 0)
 
     async def test_installation_city_after_listing_greeting(self):
         await self.turn('Здравствуйте!', title='Уличная кофейня самообслуживания')
-        row, state, _ = await self.turn('Казань', model_result={'answered': True})
+        row, state, _ = await self.turn('Добрый день!', 'Казань', model_result={'answered': True})
         self.assertEqual((row['template_id'], state), ('info_received', CLOSED))
         self.assertEqual(self.sent[-1], 'Спасибо за информацию!')
 
@@ -188,7 +232,7 @@ class ReplyLogicTests(unittest.IsolatedAsyncioTestCase):
     async def test_new_topic_during_delivery_wait_cannot_reopen(self):
         await self.turn('Сколько стоит доставка?', model_result={'id': 'clarify_delivery_city'})
         row, state, _ = await self.turn(
-            'Расскажите про уличный киоск', model_result={'answered': False},
+            'Сколько стоит кофемашина?', model_result={'answered': False},
         )
         self.assertEqual((row['template_id'], state), ('handoff', CLOSED))
         await self.turn('Казань')
@@ -269,7 +313,7 @@ class ReplyLogicTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNotNone(c.execute("SELECT 1 FROM jobs WHERE id='old'").fetchone())
 
     async def test_llm_failure_is_logged_in_job_and_chat_closes(self):
-        row, state, _ = await self.turn('Расчёт', model_result=401)
+        row, state, _ = await self.turn('Почём кофейня под ключ?', model_result=401)
         self.assertEqual((row['template_id'], state), ('model_error', CLOSED))
         await self.turn(PHONE)
         self.assertEqual(self.sent, [])
