@@ -8,6 +8,7 @@ import secrets
 import sqlite3
 import time
 from contextlib import asynccontextmanager
+from functools import partial
 from pathlib import Path
 from urllib.parse import quote
 
@@ -15,7 +16,7 @@ import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
 
-from dialogue import CLOSED, INTRO_QUESTIONS, REQUIRED, decide_safely, first_greeting
+from dialogue import CLOSED, INTRO_QUESTIONS, REQUIRED, decide_safely
 import telegram_notify
 import reconcile
 
@@ -300,11 +301,13 @@ async def process_batch(client, api, batch):
             return
 
     messages = [row['text'][:3000] for row in batch]
-    # Preview never calls Avito for listing metadata.
-    listing_title = ''
-    if state is None and not preview and chat.startswith('u2i-') and first_greeting(messages):
-        listing_title = await api.listing_title(chat)
-    reply = await decide_safely(client, messages, state, templates(), log, listing_title=listing_title)
+    # Resolve the title only after a greeting is detected.
+    get_listing_title = None
+    if state is None and not preview and chat.startswith('u2i-'):
+        get_listing_title = partial(api.listing_title, chat)
+    reply = await decide_safely(
+        client, messages, state, templates(), log, get_listing_title=get_listing_title,
+    )
     with db() as c:
         c.execute('BEGIN IMMEDIATE')
         if is_manual(c, chat):
