@@ -8,6 +8,7 @@ import secrets
 import sqlite3
 import time
 from contextlib import asynccontextmanager
+from functools import partial
 from pathlib import Path
 from urllib.parse import quote
 
@@ -17,6 +18,7 @@ from fastapi import FastAPI, HTTPException, Request
 
 from dialogue import CLOSED, INTRO_QUESTIONS, REQUIRED, decide_safely
 import telegram_notify
+import template_selector
 import reconcile
 
 BASE = Path(__file__).resolve().parent
@@ -78,6 +80,10 @@ def init_db(recover=True):
         c.execute("""CREATE TABLE IF NOT EXISTS chat_dialogue (
             chat_id TEXT NOT NULL, preview INTEGER NOT NULL, state TEXT NOT NULL,
             PRIMARY KEY (chat_id, preview))""")
+        c.execute("""CREATE TABLE IF NOT EXISTS selector_turns (
+            job_id TEXT PRIMARY KEY, chat_id TEXT NOT NULL, preview INTEGER NOT NULL, reply TEXT NOT NULL
+        )""")
+        c.execute("CREATE INDEX IF NOT EXISTS selector_turns_chat ON selector_turns(chat_id, preview)")
         if recover:
             # Old jobs do not reliably identify which question was last sent.
             migrated = c.execute(
@@ -270,12 +276,28 @@ def record_batch(conn, batch, status, action):
     conn.executemany("UPDATE jobs SET status='merged' WHERE id=?", [(row['id'],) for row in batch[:-1]])
 
 
+def selector_history(conn, chat, preview):
+    turns = conn.execute("""
+        SELECT jobs.text, selector_turns.reply
+        FROM selector_turns JOIN jobs ON jobs.id=selector_turns.job_id
+        WHERE selector_turns.chat_id=? AND selector_turns.preview=?
+        ORDER BY jobs.created DESC, jobs.rowid DESC LIMIT 8
+    """, (chat, preview)).fetchall()
+    history = []
+    for turn in reversed(turns):
+        history.extend(('buyer', text) for text in turn['text'].splitlines() if text)
+        if turn['reply']:
+            history.append(('seller', turn['reply']))
+    return history[-8:]
+
+
 async def process_batch(client, api, batch):
     claimed_at = time.time()
     job = batch[-1]
     chat = job['chat_id']
     preview = dry_run()
     skipped = 'dry_run' if preview else 'skipped'
+    use_selector = os.getenv('REPLY_SELECTOR') == 'v48'
     with db() as c:
         state = chat_state(c, chat, preview)
         if is_manual(c, chat):
@@ -285,8 +307,10 @@ async def process_batch(client, api, batch):
             record_batch(c, batch, skipped, 'closed')
             return
 
+        classifier = partial(template_selector.decide, history=selector_history(c, chat, preview)) if use_selector else None
+
     messages = [row['text'][:3000] for row in batch]
-    reply = await decide_safely(client, messages, state, templates(), log)
+    reply = await decide_safely(client, messages, state, templates(), log, classifier=classifier)
     with db() as c:
         c.execute('BEGIN IMMEDIATE')
         if is_manual(c, chat):
@@ -305,6 +329,8 @@ async def process_batch(client, api, batch):
         if preview or not reply.text:
             save_chat_state(c, chat, preview, reply.next_state)
             record_batch(c, batch, skipped, reply.id)
+            if use_selector and reply.next_state != CLOSED:
+                c.execute('INSERT INTO selector_turns VALUES (?,?,?,?)', (job['id'], chat, preview, reply.text))
             log.info('Диалог %s: %s%s', chat, reply.id, ' (DRY_RUN)' if preview else '')
             return
         record_batch(c, batch, 'sending', reply.id)
@@ -333,6 +359,8 @@ async def process_batch(client, api, batch):
         if type(outgoing) in (str, int) and outgoing:
             c.execute('INSERT OR IGNORE INTO bot_messages VALUES (?,?)', (str(outgoing), chat))
             next_state = reply.next_state
+            if use_selector and next_state != CLOSED:
+                c.execute('INSERT INTO selector_turns VALUES (?,?,?,?)', (job['id'], chat, False, reply.text))
         else:
             next_state = CLOSED
             if status == 'sent':

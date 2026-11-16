@@ -277,13 +277,15 @@ async def decide(client, messages, state, options, model=None):
     return render(selected, options, already_answered is True, welcome=state is None)
 
 
-async def decide_safely(client, messages, state, options, log):
+async def decide_safely(client, messages, state, options, log, *, classifier=None):
+    classifier = classifier or decide
     fallback = os.getenv('LLM_FALLBACK_MODEL', '').strip()
     for attempt in range(2):
         retry_after = ''
         try:
-            return await decide(client, messages, state, options,
-                                model=fallback if attempt and fallback else None)
+            return await classifier(
+                client, messages, state, options, model=fallback if attempt and fallback else None,
+            )
         except httpx.HTTPStatusError as exc:
             status = exc.response.status_code
             log.warning('API модели вернул HTTP %s (попытка %s)', status, attempt + 1)

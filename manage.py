@@ -33,6 +33,7 @@ async def main():
                     raise SystemExit('В чате есть задачи в работе. Повторите после их завершения.')
                 c.execute('DELETE FROM manual_chats WHERE chat_id=?', (args.identifier,))
                 c.execute('DELETE FROM chat_dialogue WHERE chat_id=?', (args.identifier,))
+                c.execute('DELETE FROM selector_turns WHERE chat_id=?', (args.identifier,))
             else:
                 result = c.execute(
                     "UPDATE telegram_jobs SET status='acknowledged' WHERE id=? AND status IN ('failed','unknown')",
