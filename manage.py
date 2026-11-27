@@ -4,6 +4,8 @@ import json
 import os
 from urllib.parse import urlparse
 import httpx
+import chat_statistics
+import telegram_admin
 from app import AvitoClient, config, db, dry_run, init_db, templates
 from telegram_notify import settings as telegram_settings
 
@@ -16,9 +18,15 @@ async def main():
     sub.add_parser('jobs', help='Статусы последних 50 сообщений')
     sub.add_parser('telegram-jobs', help='Статусы последних 50 уведомлений')
     sub.add_parser('check', help='Проверить настройки и шаблоны')
+    stats = sub.add_parser('stats', help='Статистика новых чатов по московскому времени')
+    stats.add_argument('--period', choices=tuple(chat_statistics.PERIODS), default='all')
     for command in ('pause-chat', 'resume-chat', 'ack-telegram'):
         sub.add_parser(command).add_argument('identifier')
     args = parser.parse_args()
+    if args.command == 'stats':
+        init_db(recover=False)
+        print(chat_statistics.format_report(chat_statistics.collect(db, args.period)))
+        return
     if args.command in ('pause-chat', 'resume-chat', 'ack-telegram'):
         init_db(recover=False)
         with db() as c:
@@ -62,11 +70,13 @@ async def main():
     cfg = config()
     if args.command == 'check':
         telegram = telegram_settings()
+        admin = telegram_admin.settings()
         if not dry_run() and not telegram:
             raise SystemExit('Для боевого режима нужны TELEGRAM_BOT_TOKEN и TELEGRAM_CHAT_ID.')
         print('Настройки и шаблоны прочитаны. ID:', ', '.join(templates()))
         print('DRY_RUN:', dry_run())
         print('Telegram:', 'настроен' if telegram else 'отключён')
+        print('Меню статистики:', 'настроено, доступ открыт всем' if admin else 'отключено')
         return
     async with httpx.AsyncClient(timeout=20) as client:
         avito = AvitoClient(client, cfg)

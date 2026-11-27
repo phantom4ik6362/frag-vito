@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, patch
 import httpx
 
 import app
+import chat_statistics
 
 
 class ReleaseSelectorTests(unittest.IsolatedAsyncioTestCase):
@@ -63,6 +64,21 @@ class ReleaseSelectorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.turn(['+7 (900) 000-00-11']), ('contact_received', 'sent', 'closed'))
         self.assertEqual(await self.turn(['Ещё вопрос']), ('closed', 'skipped', 'closed'))
         self.assertEqual(self.api.send.await_count, 3)
+
+    async def test_statistics_follow_real_queue_and_manual_chat_contacts(self):
+        await self.turn(['Улица'])
+        await self.turn(['+7 (900) 000-00-01'])
+        with app.db() as conn:
+            conn.execute("INSERT INTO manual_chats (chat_id) VALUES ('human')")
+        self.assertEqual(
+            await self.turn(['+7 (900) 000-00-02 Антон'], chat='human'),
+            ('operator', 'skipped', None),
+        )
+        report = chat_statistics.collect(app.db, 'all')
+        self.assertEqual(
+            (report.total, report.answered, report.handed_off, report.contacts, report.pending),
+            (2, 1, 1, 2, 0),
+        )
 
     async def test_custom_photo_request_hands_off_without_sending_again(self):
         self.assertEqual(await self.turn(['Улица']), ('street_overview', 'sent', 'street_details'))
