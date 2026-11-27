@@ -107,6 +107,7 @@ def init_db(recover=True):
             c.execute("UPDATE telegram_jobs SET status='unknown' WHERE status='sending'")
             resolve_seller_events(c)
         chat_statistics.initialize(c)
+        chat_statistics.migrate_contacts(c)
         chat_statistics.refresh(c)
 
 

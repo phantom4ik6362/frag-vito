@@ -2,9 +2,10 @@
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+import re
 from typing import Optional
 
-from dialogue import HANDLE, MONEY, NO_CONTACT, PHONE, has_contact
+from dialogue import CHANNEL, HANDLE, MONEY, NO_CONTACT, PHONE, has_contact
 
 MOSCOW = timezone(timedelta(hours=3), name="МСК")
 PERIODS = {
@@ -14,17 +15,21 @@ PERIODS = {
     "30d": "Последние 30 дней",
     "all": "За всё время",
 }
+GLUED_MESSENGER = re.compile(
+    rf"(?<=[0-9])(?=(?:{CHANNEL}|телеграмм)\b)", re.IGNORECASE,
+)
 
 
 def contact_supplied(text):
     """Recognize an inbound contact, including a phone followed by a name."""
     if not text or NO_CONTACT.search(text.casefold()):
         return False
-    if has_contact(text.splitlines()):
+    lines = [GLUED_MESSENGER.sub(" ", line) for line in text.splitlines()]
+    if has_contact(lines):
         return True
     if MONEY.search(text.casefold()):
         return False
-    return any(PHONE.search(line) or HANDLE.search(line) for line in text.splitlines())
+    return any(PHONE.search(line) or HANDLE.search(line) for line in lines)
 
 
 def record_incoming(conn, ident, chat, text, created, status):
@@ -49,6 +54,9 @@ def initialize(conn):
     conn.execute("""CREATE TABLE IF NOT EXISTS admin_telegram_state (
         bot_id TEXT PRIMARY KEY,
         next_update INTEGER NOT NULL
+    )""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS statistics_excluded_chats (
+        chat_id TEXT PRIMARY KEY
     )""")
     if conn.execute(
         "SELECT 1 FROM runtime_state WHERE key='statistics_backfilled_v1'"
@@ -78,6 +86,38 @@ def initialize(conn):
              int(row["template_id"] == "contact_received" or contact_supplied(row["text"]))),
         )
     conn.execute("INSERT OR IGNORE INTO runtime_state VALUES ('statistics_backfilled_v1', 1)")
+
+
+def migrate_contacts(conn):
+    if conn.execute(
+        "SELECT 1 FROM runtime_state WHERE key='statistics_contacts_v2'"
+    ).fetchone():
+        return
+    rows = conn.execute("""
+        SELECT e.job_id, j.text, j.template_id
+        FROM statistics_events AS e JOIN jobs AS j ON j.id=e.job_id
+    """).fetchall()
+    for row in rows:
+        supplied = row["template_id"] == "contact_received" or contact_supplied(row["text"])
+        conn.execute(
+            "UPDATE statistics_events SET contact_received=? WHERE job_id=?",
+            (int(supplied), row["job_id"]),
+        )
+    conn.execute("INSERT OR IGNORE INTO runtime_state VALUES ('statistics_contacts_v2', 1)")
+
+
+def set_excluded(conn, identifiers, *, excluded):
+    if not identifiers or any(
+        not isinstance(ident, str) or len(ident) > 200
+        or not re.fullmatch(r"u2[ui]-[A-Za-z0-9_~.-]+", ident)
+        for ident in identifiers
+    ):
+        raise ValueError("Нужны ID чатов Авито вида u2i-… или u2u-…")
+    sql = (
+        "INSERT OR IGNORE INTO statistics_excluded_chats VALUES (?)"
+        if excluded else "DELETE FROM statistics_excluded_chats WHERE chat_id=?"
+    )
+    conn.executemany(sql, ((ident,) for ident in identifiers))
 
 
 def refresh(conn, chat=None):
@@ -136,6 +176,10 @@ def collect(db, period, *, now=None):
                    MAX(reply_status NOT IN ('pending','processing','sending','merged','dry_run','sent')) AS handed_off
             FROM statistics_events
             WHERE received_at<=? AND reply_status!='dry_run'
+              AND NOT EXISTS (
+                  SELECT 1 FROM statistics_excluded_chats AS excluded
+                  WHERE excluded.chat_id=statistics_events.chat_id
+              )
             GROUP BY chat_id
         """, (now.timestamp(),)).fetchall()
 

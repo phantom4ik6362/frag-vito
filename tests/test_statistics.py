@@ -80,6 +80,93 @@ class StatisticsTests(unittest.TestCase):
         self.assertFalse(stats.contact_supplied("900"))
         self.assertFalse(stats.contact_supplied("0000001"))
 
+    def test_phone_glued_to_messenger_counts_without_accepting_money_or_fragments(self):
+        for text in (
+            "Нижний Новгород\n89000000001макс",
+            "+7(900)000-00-01Telegram",
+            "89000000001ватсап",
+            "89000000001whatsapp",
+            "89000000001тг",
+            "89000000001телеграмм",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(stats.contact_supplied(text))
+        for text in (
+            "мой бюджет 9000000001 рублей",
+            "Не звоните на 89000000001макс",
+            "900\n0000001макс",
+            "артикул 89000000001макс",
+            "890000000011макс",
+        ):
+            with self.subTest(text=text):
+                self.assertFalse(stats.contact_supplied(text))
+
+    def test_exclusion_applies_to_every_period_and_to_all_metrics(self):
+        first = self.now.replace(hour=0, minute=0)
+        self.incoming("u2u-test", "sent", text="+7 (900) 000-00-01", created=first-timedelta(days=40))
+        self.incoming("u2u-test", "sent", created=first-timedelta(days=10))
+        self.incoming("u2u-test", "sent", created=first-timedelta(days=2))
+        self.incoming("u2u-test", "sent")
+        self.incoming("u2i-buyer", "skipped", text="@coffee_owner")
+        with app.db() as conn:
+            stats.set_excluded(conn, ["u2u-test"], excluded=True)
+        for period in stats.PERIODS:
+            with self.subTest(period=period):
+                report = stats.collect(app.db, period, now=self.now)
+                expected = 0 if period == "yesterday" else 1
+                self.assertEqual((report.total, report.answered, report.contacts), (expected, 0, expected))
+                self.assertEqual(report.earliest, self.now-timedelta(minutes=1))
+
+    def test_exclusion_is_reversible_survives_restart_and_does_not_delete_jobs(self):
+        self.incoming("u2u-test", "sent")
+        with app.db() as conn:
+            stats.set_excluded(conn, ["u2u-test"], excluded=True)
+            stats.set_excluded(conn, ["u2u-test"], excluded=True)
+        app.init_db(recover=False)
+        self.assertEqual(stats.collect(app.db, "all", now=self.now).total, 0)
+        self.incoming("u2u-test", "skipped")
+        self.assertEqual(stats.collect(app.db, "all", now=self.now).total, 0)
+        with app.db() as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0], 2)
+            stats.set_excluded(conn, ["u2u-test"], excluded=False)
+        self.assertEqual(stats.collect(app.db, "all", now=self.now).answered, 1)
+
+    def test_exclusion_rejects_telegram_ids_before_any_change(self):
+        with app.db() as conn:
+            with self.assertRaises(ValueError):
+                stats.set_excluded(conn, ["u2u-test", "-100123"], excluded=True)
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM statistics_excluded_chats").fetchone()[0], 0)
+
+    def test_three_confirmed_test_chats_are_removed_from_every_outcome(self):
+        identifiers = [
+            "u2i-qdKY4PLv8xxGTNK9BmQejA",
+            "u2u-77HUVI~aYpJb1gZ_trEwiQ",
+            "u2i-oeR4vxd0c6MApojjnXtDSA",
+        ]
+        for ident, status in zip(identifiers, ("sent", "skipped", "pending")):
+            self.incoming(ident, status, text="89000000001макс")
+        self.incoming("u2i-real-buyer", "sent", text="@coffee_owner")
+        with app.db() as conn:
+            stats.set_excluded(conn, identifiers, excluded=True)
+        report = stats.collect(app.db, "all", now=self.now)
+        self.assertEqual(
+            (report.total, report.answered, report.handed_off, report.pending, report.contacts),
+            (1, 1, 0, 0, 1),
+        )
+
+    def test_upgrade_recounts_old_contacts_once_and_preserves_missing_source(self):
+        ident = self.incoming("u2u-contact", "skipped", text="89000000001макс")
+        deleted = self.incoming("u2u-deleted", "sent", text="@coffee_owner")
+        with app.db() as conn:
+            conn.execute("UPDATE statistics_events SET contact_received=0 WHERE job_id=?", (ident,))
+            conn.execute("DELETE FROM runtime_state WHERE key='statistics_contacts_v2'")
+            conn.execute("DELETE FROM jobs WHERE id=?", (deleted,))
+        app.init_db(recover=False)
+        report = stats.collect(app.db, "all", now=self.now)
+        self.assertEqual((report.total, report.contacts), (2, 2))
+        app.init_db(recover=False)
+        self.assertEqual(stats.collect(app.db, "all", now=self.now).contacts, 2)
+
     def test_dry_run_is_excluded_even_when_media_or_merged(self):
         with patch.dict(os.environ, {"DRY_RUN": "true"}):
             self.incoming("preview", "media")

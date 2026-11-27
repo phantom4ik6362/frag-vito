@@ -20,9 +20,27 @@ async def main():
     sub.add_parser('check', help='Проверить настройки и шаблоны')
     stats = sub.add_parser('stats', help='Статистика новых чатов по московскому времени')
     stats.add_argument('--period', choices=tuple(chat_statistics.PERIODS), default='all')
+    for command in ('stats-exclude', 'stats-include'):
+        sub.add_parser(command, help='Изменить исключения статистики').add_argument('identifiers', nargs='+')
+    sub.add_parser('stats-exclusions', help='Показать исключённые чаты Авито')
     for command in ('pause-chat', 'resume-chat', 'ack-telegram'):
         sub.add_parser(command).add_argument('identifier')
     args = parser.parse_args()
+    if args.command in ('stats-exclude', 'stats-include', 'stats-exclusions'):
+        init_db(recover=False)
+        with db() as c:
+            if args.command == 'stats-exclusions':
+                rows = c.execute('SELECT chat_id FROM statistics_excluded_chats ORDER BY chat_id').fetchall()
+                print('\n'.join(row['chat_id'] for row in rows) or 'Исключений нет.')
+            else:
+                try:
+                    chat_statistics.set_excluded(
+                        c, args.identifiers, excluded=args.command == 'stats-exclude',
+                    )
+                except ValueError as exc:
+                    raise SystemExit(str(exc)) from None
+                print('Исключения статистики обновлены.')
+        return
     if args.command == 'stats':
         init_db(recover=False)
         print(chat_statistics.format_report(chat_statistics.collect(db, args.period)))
