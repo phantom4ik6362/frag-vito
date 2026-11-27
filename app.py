@@ -19,6 +19,8 @@ from fastapi import FastAPI, HTTPException, Request
 from dialogue import CLOSED, INTRO_QUESTIONS, REQUIRED, decide_safely
 import telegram_notify
 import template_selector
+import chat_statistics
+import telegram_admin
 import reconcile
 
 BASE = Path(__file__).resolve().parent
@@ -104,6 +106,8 @@ def init_db(recover=True):
             c.execute("UPDATE jobs SET status='pending' WHERE status='processing'")
             c.execute("UPDATE telegram_jobs SET status='unknown' WHERE status='sending'")
             resolve_seller_events(c)
+        chat_statistics.initialize(c)
+        chat_statistics.refresh(c)
 
 
 def templates():
@@ -195,6 +199,8 @@ def enqueue(conn, ident, chat, message, status, action=None, attachment='[Вло
         'INSERT OR IGNORE INTO jobs (id,chat_id,text,status,created,due,template_id) VALUES (?,?,?,?,?,?,?)',
         (ident, chat, message or '', status, now, now + delay, action),
     ).rowcount
+    if inserted and not dry_run():
+        chat_statistics.record_incoming(conn, ident, chat, message or '', now, status)
     if inserted and (status == 'media' or action == 'recovered_handoff'):
         save_chat_state(conn, chat, dry_run(), CLOSED)
     if inserted and telegram_notify.settings() and not dry_run():
@@ -274,6 +280,7 @@ def record_batch(conn, batch, status, action):
         status, action, '\n'.join(row['text'] for row in batch)[-10000:], batch[-1]['id'],
     ))
     conn.executemany("UPDATE jobs SET status='merged' WHERE id=?", [(row['id'],) for row in batch[:-1]])
+    chat_statistics.refresh(conn, batch[-1]['chat_id'])
 
 
 def selector_history(conn, chat, preview):
@@ -367,6 +374,7 @@ async def process_batch(client, api, batch):
                 log.warning('Авито подтвердило ответ без ID; автоответы прекращены в чате %r', chat)
         save_chat_state(c, chat, False, next_state)
         c.execute('UPDATE jobs SET status=?, error=? WHERE id=?', (status, error, job['id']))
+        chat_statistics.refresh(c, chat)
         if status == 'sent' and next_state == CLOSED and reply.next_state != CLOSED:
             queue_notice(c, 'unconfirmed:' + job['id'], chat,
                          f'Авито приняло автоответ без ID сообщения. Автоответы остановлены. Проверьте чат: {chat}')
@@ -398,6 +406,7 @@ async def worker(cfg):
                             WHERE id=? AND status IN ('pending','processing','sending')
                         """, (job['id'],))
                     save_chat_state(c, batch[-1]['chat_id'], dry_run(), CLOSED)
+                    chat_statistics.refresh(c, batch[-1]['chat_id'])
                     resolve_seller_events(c)
                 log.exception('Не удалось обработать сообщения')
 
@@ -418,6 +427,7 @@ async def lifespan(app):
     cfg = config()
     templates()
     telegram = telegram_notify.settings()
+    admin = telegram_admin.settings()
     if not dry_run() and not telegram:
         raise RuntimeError('Для боевого режима нужны TELEGRAM_BOT_TOKEN и TELEGRAM_CHAT_ID')
     init_db()
@@ -427,6 +437,8 @@ async def lifespan(app):
         tasks.append(asyncio.create_task(telegram_notify.worker(db, telegram), name='telegram'))
     if interval > 0 and not dry_run():
         tasks.append(asyncio.create_task(reconcile_worker(cfg, max(60, interval)), name='reconcile'))
+    if admin:
+        tasks.append(asyncio.create_task(telegram_admin.worker(db, admin), name='telegram-admin'))
     app.state.workers = tasks
     for task in tasks:
         task.add_done_callback(watch)
