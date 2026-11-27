@@ -1,4 +1,4 @@
-# Меню статистики в отдельном Telegram-боте
+# Меню статистики. Обновление подсчёта и тестовые чаты
 
 Новый бот запускается в контейнере FRAG-VITO и получает команды через
 long polling. Для него используется отдельный токен.
@@ -38,6 +38,39 @@ long polling. Для него используется отдельный ток
 В отчёте за вчера могут быть учтены ответы бота и контакты, полученные
 сегодня в тех же чатах.
 
+## Исключения тестовых чатов
+
+Используй ID диалогов Авито вида u2i-… или u2u-… .
+ID Telegram-пользователя или группы для этой команды не подходит.
+
+После выкладки выполни на VPS. Ниже указаны три тестовых чата, согласованные для исключения.
+
+~~~bash
+docker exec fragvito python manage.py stats-exclude \
+  'u2i-qdKY4PLv8xxGTNK9BmQejA' \
+  'u2u-77HUVI~aYpJb1gZ_trEwiQ' \
+  'u2i-oeR4vxd0c6MApojjnXtDSA'
+docker exec fragvito python manage.py stats-exclusions
+docker exec fragvito python manage.py stats --period all
+~~~
+
+Можно исключить сразу несколько чатов. Они исчезнут из всех показателей,
+включая старую историю и дату начала доступных данных.
+Список сохраняется в томе с базой и действует после перезапуска.
+Чат, который ранее не встречался в базе, можно исключить заранее.
+
+Чтобы вернуть чат в отчёты, выполни следующую команду.
+
+~~~bash
+docker exec fragvito python manage.py stats-include 'u2u-77HUVI~aYpJb1gZ_trEwiQ'
+~~~
+
+Номер, написанный слитно с названием мессенджера, например
+«89000000001макс» или «+7(900)000-00-01Telegram», распознаётся как контакт.
+Старые признаки контактов пересчитываются при первом запуске обновления,
+если исходные сообщения сохранились в jobs. Суммы бюджета и обрывки номера
+из отдельных сообщений не соединяются в контакт.
+
 ## История
 
 При первом запуске создаются таблицы statistics_events и admin_telegram_state.
@@ -53,7 +86,7 @@ long polling. Для него используется отдельный ток
 DRY_RUN после обновления исключается. В старой истории исключаются
 известные dry-run записи. Для старых смешанных пачек режим каждого
 сообщения не всегда восстановим. Тесты через боевой аккаунт Авито входят
-в статистику наравне с другими обращениями.
+в статистику, если их chat_id не добавлен в исключения.
 
 Телефоны и никнеймы распознаются по поддерживаемым форматам. Само слово
 «Telegram» или «WhatsApp» без контакта не засчитывается. Признак контакта
@@ -85,32 +118,24 @@ DRY_RUN после обновления исключается. В старой 
 (
   set -e
   git fetch origin main
-  git switch -c feature/telegram-statistics origin/main
-  git apply --check --index ~/Downloads/fragvito-admin-stats.patch
-  git apply --index ~/Downloads/fragvito-admin-stats.patch
+  git switch -c fix/statistics-exclusions origin/main
+  git apply --check --index ~/Downloads/fragvito-stats-v2.patch
+  git apply --index ~/Downloads/fragvito-stats-v2.patch
   git diff --cached --check
   python3 -m venv .venv
   .venv/bin/python -m pip install -r requirements.txt
   .venv/bin/python -m unittest discover -s tests
-  git commit -m "Add Telegram statistics menu with chat-based reports"
-  git push -u origin feature/telegram-statistics
+  git commit -m "Exclude test chats and recount messenger contacts"
+  git push -u origin fix/statistics-exclusions
 )
 ```
 
-Открой PR из feature/telegram-statistics в main. После слияния обновляй VPS.
+Открой PR из fix/statistics-exclusions в main. После слияния обновляй VPS.
 
 ## VPS
 
-Создай отдельного бота через BotFather. Токен нужен только на VPS.
-Добавь его в файл настроек.
-
-```bash
-sudoedit /etc/fragvito/bot.env
-```
-
-```dotenv
-TELEGRAM_ADMIN_BOT_TOKEN=ТОКЕН_НОВОГО_БОТА
-```
+Обновление использует уже настроенный TELEGRAM_ADMIN_BOT_TOKEN
+из /etc/fragvito/bot.env. Повторно создавать Telegram-бота не требуется.
 
 После слияния PR проверь действующий том и порт.
 
@@ -184,14 +209,19 @@ else
   exit 1
 fi
 
+docker exec fragvito python manage.py stats-exclude \
+  'u2i-qdKY4PLv8xxGTNK9BmQejA' \
+  'u2u-77HUVI~aYpJb1gZ_trEwiQ' \
+  'u2i-oeR4vxd0c6MApojjnXtDSA'
+docker exec fragvito python manage.py stats-exclusions
 docker exec fragvito python manage.py stats --period all
 BASH
 ```
 
 ## Проверка
 
-1. Открой нового бота и отправь /start.
-2. Нажми каждую из пяти кнопок.
+1. Открой бота статистики и отправь /start.
+2. Нажми каждую из пяти кнопок. Исключённые тестовые чаты не должны попадать ни в один отчёт.
 3. Сравни отчёт «За всё время» с командой ниже.
 4. Отправь /start с другого аккаунта. Доступ также должен работать.
 
